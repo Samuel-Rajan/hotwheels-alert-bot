@@ -1,66 +1,102 @@
 import logging
 import os
 import asyncio
+import re
 from playwright.async_api import async_playwright
+
+def extract_product_id(url):
+    """Extracts a clean, stable product ID from a URL to prevent duplicate/false triggers."""
+    if not url:
+        return ""
+    # Look for common product path patterns (e.g., /p/, /prid/, /dp/, numeric IDs)
+    match = re.search(r'/(?:p|prid|dp|ip|product)/([a-zA-Z0-9\-_]+)', url)
+    if match:
+        return match.group(1)
+    # Fallback to last meaningful path segment if numeric or alphanumeric code exists
+    segments = [s for s in url.split('/') if s]
+    if segments:
+        return segments[-1]
+    return url
 
 async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"):
     """
-    Scraper strictly filtered for Indian storefronts, validating Indian currency (₹) 
-    and rejecting international or cross-border mirrors.
+    Precision scraper that targets genuine product containers and excludes 
+    category links, banners, and search filters.
     """
     in_stock_items = []
     try:
-        logging.info(f"[{store_name}] Navigating to Indian store URL: {url}")
+        logging.info(f"[{store_name}] Navigating to URL: {url}")
         response = await page.goto(url, wait_until="domcontentloaded", timeout=35000)
         
         if response and response.status >= 400:
             logging.warning(f"[{store_name}] HTTP status {response.status} encountered.")
 
-        # Simulate human scrolling to trigger lazy-loaded items
+        # Simulate scrolling to load lazy items
         for _ in range(3):
             await page.evaluate("window.scrollBy(0, window.innerHeight)")
             await asyncio.sleep(1.5)
 
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(3000)
 
-        # Scan elements on the page
-        elements = await page.locator("a, div[class*='product'], div[class*='item'], div[class*='card'], li").all()
-        seen_links = set()
+        # Target specific product card wrappers rather than random page links
+        card_selectors = [
+            "div[class*='product']", "div[class*='item-card']", 
+            "div[class*='card']", "li[class*='product']", ".prod-item"
+        ]
+        
+        cards = []
+        for sel in card_selectors:
+            cards = await page.locator(sel).all()
+            if cards:
+                break
 
-        for el in elements:
+        # Fallback if specific cards aren't found
+        if not cards:
+            cards = await page.locator("a[href]").all()
+
+        seen_ids = set()
+
+        for card in cards:
             try:
-                text = await el.inner_text()
+                text = await card.inner_text()
                 if not text or keyword not in text.lower():
                     continue
 
-                # REJECTION CHECK: Ensure no international indicators (AED, SAR, UAE, KSA) are in the text block
+                # Exclude category/search/banner text blocks
                 text_lower = text.lower()
-                if any(geo_term in text_lower for geo_term in ["aed", "sar", "dubai", "riyadh", "uae", "saudi", "firstcry.ae"]):
+                if any(excluded in text_lower for excluded in ["category", "filter", "sort by", "sponsored ad"]):
                     continue
 
-                # Extract link href
-                href = await el.get_attribute("href")
-                if not href:
-                    sub_a = el.locator("a").first
-                    if await sub_a.count() > 0:
-                        href = await sub_a.get_attribute("href")
+                # Find the product link
+                href = ""
+                tag_name = await card.evaluate("el => el.tagName.toLowerCase()")
+                if tag_name == "a":
+                    href = await card.get_attribute("href")
+                else:
+                    link_elem = card.locator("a[href]").first
+                    if await link_elem.count() > 0:
+                        href = await link_elem.get_attribute("href")
 
-                if not href or href in seen_links or href == "#":
+                if not href or href == "#":
                     continue
-                
-                # REJECTION CHECK: Ensure link domain does not point to international extensions
-                if any(domain in href.lower() for domain in [".ae", ".sa", "firstcry.ae", "firstcry.sa"]):
+
+                # Ignore search result links or pagination links that aren't individual products
+                if "/search?" in href or "/s?" in href or "query=" in href:
                     continue
 
-                seen_links.add(href)
+                prod_id = extract_product_id(href)
+                if not prod_id or prod_id in seen_ids:
+                    continue
 
-                # Clean up product title
+                seen_ids.add(prod_id)
+
+                # Clean title
                 lines = [line.strip() for line in text.split("\n") if line.strip()]
                 title = lines[0] if lines else "Hot Wheels Product"
                 if len(title) < 5:
                     continue
 
-                # Extract or verify Indian currency symbol if visible in block
+                # Extract price if visible
                 price_str = "Check App"
                 for line in lines:
                     if "₹" in line or "INR" in line:
@@ -69,7 +105,7 @@ async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"
 
                 in_stock_items.append({
                     "platform": store_name,
-                    "id": href,
+                    "id": prod_id,
                     "title": title,
                     "price": price_str,
                     "mrp": "",
@@ -89,7 +125,7 @@ async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"
     return in_stock_items
 
 async def fetch_all_stores():
-    """Asynchronously scrapes Indian quick-commerce and e-commerce inventories."""
+    """Asynchronously scrapes Indian quick-commerce inventories with strict product filtering."""
     all_in_stock = []
     
     async with async_playwright() as p:
@@ -111,13 +147,13 @@ async def fetch_all_stores():
             locale="en-IN",
             timezone_id="Asia/Kolkata",
             permissions=["geolocation"],
-            geolocation={"latitude": 13.0827, "longitude": 80.2707} # Chennai, India Coordinates
+            geolocation={"latitude": 13.0827, "longitude": 80.2707} # Chennai, India
         )
 
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = await context.new_page()
 
-        # --- 1. FIRSTCRY (INDIA EXCLUSIVE) ---
+        # --- 1. FIRSTCRY ---
         firstcry_items = await fetch_store_with_fallbacks(page, "FirstCry", "https://www.firstcry.com/search?q=hot%20wheels")
         for item in firstcry_items:
             if item["link"].startswith("//"):
@@ -126,14 +162,14 @@ async def fetch_all_stores():
                 item["link"] = f"https://www.firstcry.com{item['link']}"
         all_in_stock.extend(firstcry_items)
 
-        # --- 2. BLINKIT (INDIA) ---
+        # --- 2. BLINKIT ---
         blinkit_items = await fetch_store_with_fallbacks(page, "Blinkit", "https://blinkit.com/s/?q=hot%20wheels")
         for item in blinkit_items:
             if item["link"].startswith("/"):
                 item["link"] = f"https://blinkit.com{item['link']}"
         all_in_stock.extend(blinkit_items)
 
-        # --- 3. ZEPTO (INDIA) ---
+        # --- 3. ZEPTO ---
         zepto_items = await fetch_store_with_fallbacks(page, "Zepto", "https://www.zeptonow.com/search?query=hot%20wheels")
         for item in zepto_items:
             if item["link"].startswith("/"):
