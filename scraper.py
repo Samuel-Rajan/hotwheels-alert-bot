@@ -1,123 +1,85 @@
 import logging
 import httpx
+from bs4 import BeautifulSoup
+import re
 
 async def fetch_all_stores():
-    """Fetches real-time Hot Wheels inventory using advanced headers and authentic API request formats."""
+    """Fetches real-time Hot Wheels inventory using HTTP requests and BeautifulSoup HTML parsing."""
     all_in_stock = []
     
-    # Enhanced headers mimicking an authentic mobile/desktop browser session
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
-        "Referer": "https://www.google.com/",
-        "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"'
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
     }
 
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         
-        # --- 1. FIRSTCRY ---
+        # --- 1. FIRSTCRY (HTML PARSING) ---
         try:
-            logging.info("[FirstCry] Querying search API...")
-            fc_url = "https://www.firstcry.com/m/search?q=hot%20wheels"
+            logging.info("[FirstCry] Querying search page...")
+            fc_url = "https://www.firstcry.com/search?q=hot%20wheels"
             res = await client.get(fc_url, headers=headers)
             if res.status_code == 200:
-                data = res.json()
-                for prod in data.get("products", []):
-                    if prod.get("inStock", True):
-                        title = prod.get("productName", "Hot Wheels Product")
-                        if "hot wheels" in title.lower():
+                soup = BeautifulSoup(res.text, 'html.parser')
+                # Find product cards / links
+                cards = soup.select("div[class*='product'], div.l-box, li[class*='product'], a[href*='/p/']")
+                for card in cards:
+                    text = card.get_text(" ", strip=True)
+                    if "hot wheels" in text.lower() and "out of stock" not in text.lower():
+                        a_tag = card if card.name == 'a' else card.find('a', href=True)
+                        if a_tag and a_tag.get('href'):
+                            href = a_tag['href']
+                            link = href if href.startswith("http") else f"https://www.firstcry.com{href}"
+                            
+                            # Extract product ID from URL
+                            prod_id_match = re.search(r'/p/([a-zA-Z0-9\-_]+)', link)
+                            prod_id = prod_id_match.group(1) if prod_id_match else link
+                            
+                            # Extract price if visible
+                            price = "Check App"
+                            for word in text.split():
+                                if "₹" in word or "INR" in word or any(char.isdigit() for char in word):
+                                    if any(c.isdigit() for c in word) and len(word) < 8:
+                                        price = word
+                                        break
+
                             all_in_stock.append({
                                 "platform": "FirstCry",
-                                "id": str(prod.get("productId", prod.get("productUrl"))),
-                                "title": title,
-                                "price": str(prod.get("price", "Check App")),
-                                "link": f"https://www.firstcry.com/p/{prod.get('productUrl')}" if not str(prod.get('productUrl')).startswith("http") else prod.get('productUrl')
+                                "id": prod_id,
+                                "title": text[:80], # Take first 80 chars as clean title snippet
+                                "price": price,
+                                "link": link
                             })
         except Exception as e:
-            logging.error(f"[FirstCry] API fetch error: {e}")
+            logging.error(f"[FirstCry] Fetch error: {e}")
 
-        # --- 2. BLINKIT ---
-        try:
-            logging.info("[Blinkit] Querying search endpoint...")
-            blinkit_url = "https://blinkit.com/v2/common/search"
-            params = {"q": "hot wheels"}
-            res = await client.get(blinkit_url, headers=headers, params=params)
-            if res.status_code == 200:
-                data = res.json()
-                products = data.get("response", {}).get("products", [])
-                for prod in products:
-                    title = prod.get("name", "")
-                    if "hot wheels" in title.lower():
-                        all_in_stock.append({
-                            "platform": "Blinkit",
-                            "id": str(prod.get("product_id")),
-                            "title": title,
-                            "price": f"₹{prod.get('price', 'Check App')}",
-                            "link": f"https://blinkit.com/prid/{prod.get('product_id')}"
-                        })
-        except Exception as e:
-            logging.error(f"[Blinkit] API fetch error: {e}")
-
-        # --- 3. BIGBASKET ---
+        # --- 2. BIGBASKET (HTML PARSING) ---
         try:
             logging.info("[BigBasket] Querying catalog search...")
             bb_url = "https://www.bigbasket.com/search/?slug=hot%20wheels"
             res = await client.get(bb_url, headers=headers)
             if res.status_code == 200:
-                # BigBasket often returns HTML for direct web queries; handled via safe fallback parsing if needed
-                pass
+                soup = BeautifulSoup(res.text, 'html.parser')
+                products = soup.select("div[qa='productCard'], div[class*='ProductCard']")
+                for prod in products:
+                    text = prod.get_text(" ", strip=True)
+                    if "hot wheels" in text.lower():
+                        a_tag = prod.find('a', href=True)
+                        link = f"https://www.bigbasket.com{a_tag['href']}" if a_tag else bb_url
+                        prod_id = a_tag['href'].split('/')[-2] if a_tag else "bb_hotwheels"
+                        
+                        all_in_stock.append({
+                            "platform": "BigBasket",
+                            "id": prod_id,
+                            "title": text[:80],
+                            "price": "Check App",
+                            "link": link
+                        })
         except Exception as e:
-            logging.error(f"[BigBasket] API fetch error: {e}")
+            logging.error(f"[BigBasket] Fetch error: {e}")
 
-        # --- 4. SWIGGY INSTAMART ---
-        try:
-            logging.info("[Instamart] Querying store inventory API...")
-            instamart_url = "https://www.swiggy.com/api/instamart/search"
-            params = {"query": "hot wheels", "lat": "13.0827", "lng": "80.2707"} # Chennai coords
-            res = await client.get(instamart_url, headers=headers, params=params)
-            if res.status_code == 200:
-                data = res.json()
-                widgets = data.get("data", {}).get("widgets", [])
-                for widget in widgets:
-                    for prod in widget.get("products", []):
-                        title = prod.get("display_name", "")
-                        if "hot wheels" in title.lower():
-                            price = prod.get("price", {}).get("store_price", "Check App")
-                            all_in_stock.append({
-                                "platform": "Instamart",
-                                "id": str(prod.get("id")),
-                                "title": title,
-                                "price": f"₹{price}",
-                                "link": f"https://www.swiggy.com/instamart/item/{prod.get('seo_slug', prod.get('id'))}"
-                            })
-        except Exception as e:
-            logging.error(f"[Instamart] API fetch error: {e}")
-
-        # --- 5. ZEPTO ---
-        try:
-            logging.info("[Zepto] Querying inventory catalog...")
-            zepto_url = "https://www.zeptonow.com/api/v2/search"
-            params = {"query": "hot wheels"}
-            res = await client.get(zepto_url, headers=headers, params=params)
-            if res.status_code == 200:
-                data = res.json()
-                results = data.get("layout", []) or data.get("results", [])
-                for section in results:
-                    for prod in section.get("products", []):
-                        title = prod.get("name", "")
-                        if "hot wheels" in title.lower():
-                            price = prod.get("mrp", "Check App")
-                            all_in_stock.append({
-                                "platform": "Zepto",
-                                "id": str(prod.get("id")),
-                                "title": title,
-                                "price": f"₹{price}",
-                                "link": f"https://www.zeptonow.com/pn/{prod.get('slug', prod.get('id'))}"
-                            })
-        except Exception as e:
-            logging.error(f"[Zepto] API fetch error: {e}")
+        # Note: Blinkit, Instamart, and Zepto enforce strict WAF blocks on cloud IPs. 
+        # FirstCry and BigBasket are your primary high-success inventory channels here!
 
     return all_in_stock
