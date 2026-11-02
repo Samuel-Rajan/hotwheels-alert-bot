@@ -8,20 +8,18 @@ def extract_product_id(url):
     """Extracts a clean, stable product ID from a URL to prevent duplicate/false triggers."""
     if not url:
         return ""
-    # Look for common product path patterns (e.g., /p/, /prid/, /dp/, numeric IDs)
     match = re.search(r'/(?:p|prid|dp|ip|product)/([a-zA-Z0-9\-_]+)', url)
     if match:
         return match.group(1)
-    # Fallback to last meaningful path segment if numeric or alphanumeric code exists
-    segments = [s for s in url.split('/') if s]
-    if segments:
-        return segments[-1]
+    parts = [p for p in url.split('/') if p]
+    if parts:
+        return parts[-1]
     return url
 
 async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"):
     """
-    Precision scraper that targets genuine product containers and excludes 
-    category links, banners, and search filters.
+    Robust scraper with modal dismissal, out-of-stock exclusion, 
+    and precise product container targeting.
     """
     in_stock_items = []
     try:
@@ -31,6 +29,16 @@ async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"
         if response and response.status >= 400:
             logging.warning(f"[{store_name}] HTTP status {response.status} encountered.")
 
+        # --- SPECIAL HANDLING FOR FIRSTCRY MODALS ---
+        if store_name == "FirstCry":
+            try:
+                close_btn = page.locator(".cross-icon, .close-btn, button[class*='close'], .popup-close").first
+                if await close_btn.is_visible(timeout=3000):
+                    await close_btn.click()
+                    logging.info("[FirstCry] Dismissed location/pincode popup modal.")
+            except Exception:
+                pass
+
         # Simulate scrolling to load lazy items
         for _ in range(3):
             await page.evaluate("window.scrollBy(0, window.innerHeight)")
@@ -38,7 +46,6 @@ async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"
 
         await page.wait_for_timeout(3000)
 
-        # Target specific product card wrappers rather than random page links
         card_selectors = [
             "div[class*='product']", "div[class*='item-card']", 
             "div[class*='card']", "li[class*='product']", ".prod-item"
@@ -50,7 +57,6 @@ async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"
             if cards:
                 break
 
-        # Fallback if specific cards aren't found
         if not cards:
             cards = await page.locator("a[href]").all()
 
@@ -62,12 +68,12 @@ async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"
                 if not text or keyword not in text.lower():
                     continue
 
-                # Exclude category/search/banner text blocks
                 text_lower = text.lower()
-                if any(excluded in text_lower for excluded in ["category", "filter", "sort by", "sponsored ad"]):
+                
+                # Explicitly skip if the card says "Out of Stock" or is a filter/banner
+                if any(excluded in text_lower for excluded in ["out of stock", "sold out", "category", "filter", "sort by", "sponsored ad"]):
                     continue
 
-                # Find the product link
                 href = ""
                 tag_name = await card.evaluate("el => el.tagName.toLowerCase()")
                 if tag_name == "a":
@@ -77,11 +83,7 @@ async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"
                     if await link_elem.count() > 0:
                         href = await link_elem.get_attribute("href")
 
-                if not href or href == "#":
-                    continue
-
-                # Ignore search result links or pagination links that aren't individual products
-                if "/search?" in href or "/s?" in href or "query=" in href:
+                if not href or href == "#" or "/search?" in href or "/s?" in href:
                     continue
 
                 prod_id = extract_product_id(href)
@@ -90,13 +92,11 @@ async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"
 
                 seen_ids.add(prod_id)
 
-                # Clean title
                 lines = [line.strip() for line in text.split("\n") if line.strip()]
                 title = lines[0] if lines else "Hot Wheels Product"
                 if len(title) < 5:
                     continue
 
-                # Extract price if visible
                 price_str = "Check App"
                 for line in lines:
                     if "₹" in line or "INR" in line:
@@ -110,7 +110,7 @@ async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"
                     "price": price_str,
                     "mrp": "",
                     "image": "",
-                    "link": href
+                    "link": href if href.startswith("http") else f"https://www.firstcry.com{href}" if store_name == "FirstCry" else href
                 })
             except Exception:
                 continue
@@ -118,6 +118,9 @@ async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"
         if not in_stock_items:
             os.makedirs("debug_logs", exist_ok=True)
             await page.screenshot(path=f"debug_logs/{store_name.lower()}_empty.png")
+            with open(f"debug_logs/{store_name.lower()}_empty.html", "w", encoding="utf-8") as f:
+                f.write(await page.content())
+            logging.warning(f"[{store_name}] Zero in-stock items found. Debug snapshot saved.")
 
     except Exception as e:
         logging.error(f"[{store_name}] Exception during fetch: {e}")
@@ -125,7 +128,7 @@ async def fetch_store_with_fallbacks(page, store_name, url, keyword="hot wheels"
     return in_stock_items
 
 async def fetch_all_stores():
-    """Asynchronously scrapes Indian quick-commerce inventories with strict product filtering."""
+    """Asynchronously scrapes Indian quick-commerce inventories with strict modal handling and OOS filtering."""
     all_in_stock = []
     
     async with async_playwright() as p:
@@ -147,7 +150,7 @@ async def fetch_all_stores():
             locale="en-IN",
             timezone_id="Asia/Kolkata",
             permissions=["geolocation"],
-            geolocation={"latitude": 13.0827, "longitude": 80.2707} # Chennai, India
+            geolocation={"latitude": 13.0827, "longitude": 80.2707}
         )
 
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -155,25 +158,14 @@ async def fetch_all_stores():
 
         # --- 1. FIRSTCRY ---
         firstcry_items = await fetch_store_with_fallbacks(page, "FirstCry", "https://www.firstcry.com/search?q=hot%20wheels")
-        for item in firstcry_items:
-            if item["link"].startswith("//"):
-                item["link"] = f"https:{item['link']}"
-            elif item["link"].startswith("/"):
-                item["link"] = f"https://www.firstcry.com{item['link']}"
         all_in_stock.extend(firstcry_items)
 
         # --- 2. BLINKIT ---
         blinkit_items = await fetch_store_with_fallbacks(page, "Blinkit", "https://blinkit.com/s/?q=hot%20wheels")
-        for item in blinkit_items:
-            if item["link"].startswith("/"):
-                item["link"] = f"https://blinkit.com{item['link']}"
         all_in_stock.extend(blinkit_items)
 
         # --- 3. ZEPTO ---
         zepto_items = await fetch_store_with_fallbacks(page, "Zepto", "https://www.zeptonow.com/search?query=hot%20wheels")
-        for item in zepto_items:
-            if item["link"].startswith("/"):
-                item["link"] = f"https://www.zeptonow.com{item['link']}"
         all_in_stock.extend(zepto_items)
 
         await browser.close()
