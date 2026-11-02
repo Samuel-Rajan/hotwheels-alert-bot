@@ -4,9 +4,8 @@ import logging
 from telegram import Bot
 from telegram.constants import ParseMode
 from scraper import fetch_all_stores
-from db import init_db, is_new_item, save_item
+from db import init_db, process_item_and_check_restock
 
-# --- CONFIGURATION (Loaded from GitHub Secrets) ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -15,7 +14,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 async def send_stock_alert(bot: Bot, item: dict):
     """Formats and sends a Telegram message with an image and buy link."""
     message = (
-        f"🔥 <b>HOT WHEELS STOCK ALERT!</b> 🔥\n\n"
+        f"🔥 <b>HOT WHEELS STOCK / RESTOCK ALERT!</b> 🔥\n\n"
         f"🏎️ <b>Product:</b> {item['title']}\n"
         f"🏬 <b>Store:</b> {item['platform']}\n"
         f"💰 <b>Price:</b> ₹{item['price']} (MRP: ₹{item['mrp']})\n\n"
@@ -42,7 +41,7 @@ async def send_stock_alert(bot: Bot, item: dict):
 async def monitor_stock():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     init_db()
-    logging.info("Checking all stores for Hot Wheels...")
+    logging.info("Checking all stores for Hot Wheels (with restock detection)...")
 
     try:
         available_items = await fetch_all_stores()
@@ -50,11 +49,10 @@ async def monitor_stock():
         for item in available_items:
             unique_key = f"{item['platform']}_{item['id']}"
             
-            # Check if this is a newly listed / restocked item
-            if is_new_item(unique_key):
-                logging.info(f"New stock detected: {item['title']} on {item['platform']}")
+            # Check if this is a new item OR a restock after going out of stock
+            if process_item_and_check_restock(unique_key, item['platform'], item['title']):
+                logging.info(f"Stock/Restock detected: {item['title']} on {item['platform']}")
                 await send_stock_alert(bot, item)
-                save_item(unique_key, item['platform'], item['title'])
                 
     except Exception as e:
         logging.error(f"Error during execution cycle: {e}")
