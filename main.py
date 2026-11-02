@@ -12,12 +12,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 async def send_stock_alert(bot: Bot, item: dict):
-    """Formats and sends a Telegram message with an image and buy link."""
+    """Formats and sends a Telegram message with a buy link."""
     message = (
         f"🔥 <b>HOT WHEELS STOCK / RESTOCK ALERT!</b> 🔥\n\n"
         f"🏎️ <b>Product:</b> {item['title']}\n"
         f"🏬 <b>Store:</b> {item['platform']}\n"
-        f"💰 <b>Price:</b> ₹{item['price']} (MRP: ₹{item['mrp']})\n\n"
+        f"💰 <b>Price:</b> {item['price']}\n\n"
         f"🔗 <a href='{item['link']}'><b>Click here to Buy Now</b></a>"
     )
     
@@ -49,7 +49,6 @@ async def monitor_stock():
         for item in available_items:
             unique_key = f"{item['platform']}_{item['id']}"
             
-            # Check if this is a new item OR a restock after going out of stock
             if process_item_and_check_restock(unique_key, item['platform'], item['title']):
                 logging.info(f"Stock/Restock detected: {item['title']} on {item['platform']}")
                 await send_stock_alert(bot, item)
