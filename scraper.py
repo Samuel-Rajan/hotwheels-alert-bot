@@ -1,8 +1,7 @@
 import logging
 import httpx
-from bs4نهار import BeautifulSoup
-import re
 from bs4 import BeautifulSoup
+import re
 
 async def fetch_all_stores():
     """
