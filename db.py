@@ -19,9 +19,7 @@ def init_db():
 def process_item_and_check_restock(platform_id, platform, title, expiry_minutes=30):
     """
     Checks if an item is new or has returned from being out of stock.
-    - If it's not in the DB, or hasn't been seen for > expiry_minutes (meaning it went out of stock),
-      it returns True (triggers a new alert).
-    - Upserts the item with the current timestamp.
+    Returns True if an alert should be sent.
     """
     conn = sqlite3.connect("inventory.db")
     cursor = conn.cursor()
@@ -29,17 +27,14 @@ def process_item_and_check_restock(platform_id, platform, title, expiry_minutes=
     now = datetime.now()
     cutoff_time = now - timedelta(minutes=expiry_minutes)
     
-    # Check if item exists in database
     cursor.execute("SELECT last_seen FROM active_inventory WHERE platform_id = ?", (platform_id,))
     row = cursor.fetchone()
     
     is_alertable = False
     
     if row is None:
-        # Brand new item
         is_alertable = True
     else:
-        # Item exists, check when it was last seen
         last_seen_str = row[0]
         try:
             last_seen_time = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S.%f")
@@ -50,10 +45,8 @@ def process_item_and_check_restock(platform_id, platform, title, expiry_minutes=
                 last_seen_time = cutoff_time - timedelta(days=1)
                 
         if last_seen_time < cutoff_time:
-            # It was out of stock long enough to expire, so its return is a restock alert!
             is_alertable = True
             
-    # Upsert the item with current timestamp
     cursor.execute('''
         INSERT OR REPLACE INTO active_inventory (platform_id, platform, title, last_seen)
         VALUES (?, ?, ?, ?)
