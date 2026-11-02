@@ -9,7 +9,7 @@ jobs:
   check-stock:
     runs-on: ubuntu-latest
     
-    # CRITICAL: Grant write permissions so the auto-commit action can save inventory.db
+    # CRITICAL: Grant write permissions so inventory.db can be saved back to repo
     permissions:
       contents: write
 
