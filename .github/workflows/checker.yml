@@ -8,6 +8,11 @@ on:
 jobs:
   check-stock:
     runs-on: ubuntu-latest
+    
+    # CRITICAL: Grant write permissions so the auto-commit action can save inventory.db
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
