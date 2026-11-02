@@ -13,12 +13,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 async def send_stock_alert(bot: Bot, item: dict):
     """Formats and sends a Telegram message with a buy link."""
+    title = item.get('title', 'Hot Wheels Product')
+    platform = item.get('platform', 'Store')
+    price = item.get('price', 'Check App')
+    link = item.get('link', 'https://google.com')
+    
     message = (
         f"🔥 <b>HOT WHEELS STOCK / RESTOCK ALERT!</b> 🔥\n\n"
-        f"🏎️ <b>Product:</b> {item['title']}\n"
-        f"🏬 <b>Store:</b> {item['platform']}\n"
-        f"💰 <b>Price:</b> {item['price']}\n\n"
-        f"🔗 <a href='{item['link']}'><b>Click here to Buy Now</b></a>"
+        f"🏎️ <b>Product:</b> {title}\n"
+        f"🏬 <b>Store:</b> {platform}\n"
+        f"💰 <b>Price:</b> {price}\n\n"
+        f"🔗 <a href='{link}'><b>Click here to Buy Now</b></a>"
     )
     
     try:
@@ -41,16 +46,23 @@ async def send_stock_alert(bot: Bot, item: dict):
 async def monitor_stock():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     init_db()
-    logging.info("Checking all stores for Hot Wheels (with restock detection)...")
+    logging.info("Checking all quick-commerce APIs for Hot Wheels...")
 
     try:
         available_items = await fetch_all_stores()
         
         for item in available_items:
-            unique_key = f"{item['platform']}_{item['id']}"
+            platform = item.get('platform', 'Store')
+            prod_id = item.get('id', '')
+            title = item.get('title', '')
             
-            if process_item_and_check_restock(unique_key, item['platform'], item['title']):
-                logging.info(f"Stock/Restock detected: {item['title']} on {item['platform']}")
+            if not prod_id or not title:
+                continue
+                
+            unique_key = f"{platform}_{prod_id}"
+            
+            if process_item_and_check_restock(unique_key, platform, title):
+                logging.info(f"Stock/Restock detected: {title} on {platform}")
                 await send_stock_alert(bot, item)
                 
     except Exception as e:
