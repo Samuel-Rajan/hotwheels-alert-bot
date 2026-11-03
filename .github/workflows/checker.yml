@@ -2,7 +2,7 @@ name: Hot Wheels Stock Checker
 
 on:
   schedule:
-    - cron: '*/5 * * * *'      # GitHub's minimum; real spacing is often 5-15 min
+    - cron: '3-59/5 * * * *'     # every 5 min at :03, :08, :13... (off the congested :00/:05 marks)
   workflow_dispatch:
 
 permissions:
