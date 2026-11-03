@@ -5,17 +5,22 @@ import re
 from playwright.async_api import async_playwright
 
 async def fetch_all_stores():
-    """
-    Robust multi-store scraper using Playwright (Headless Chromium) for FirstCry 
-    to execute JS-rendered React/Next.js cards, and httpx for quick-commerce apps.
-    """
     all_in_stock = []
     
-    headers = {
+    # Advanced mobile headers to bypass WAF / Cloudflare
+    stealth_headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-IN,en;q=0.9",
-        "Cache-Control": "no-cache",
+        "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
         "x-location-context": "13.0827,80.2707",
     }
 
@@ -32,11 +37,8 @@ async def fetch_all_stores():
                 locale="en-IN"
             )
             page = await context.new_page()
-            
-            # Navigate to FirstCry search sorted by newness
             await page.goto("https://www.firstcry.com/search?q=hot%20wheels&sort=newness", timeout=15000)
             
-            # Wait for product cards to render in the DOM
             try:
                 await page.wait_for_selector("div[class*='product'], li[class*='product'], .prod-item, a[href*='/p/']", timeout=8000)
             except Exception:
@@ -81,15 +83,15 @@ async def fetch_all_stores():
         logging.error(f"[FirstCry Playwright] Error: {e}")
 
     # ==========================================
-    # QUICK-COMMERCE APPS (HTTPX)
+    # QUICK-COMMERCE APPS (HTTPX with Stealth Headers)
     # ==========================================
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, http2=True) as client:
         
         # --- 2. BIGBASKET ---
         try:
             logging.info("[BigBasket] Querying catalog search...")
             bb_url = "https://www.bigbasket.com/search/?slug=hot%20wheels"
-            res = await client.get(bb_url, headers=headers)
+            res = await client.get(bb_url, headers=stealth_headers)
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, 'html.parser')
                 products = soup.select("div[qa='productCard'], div[class*='ProductCard'], a[href*='/pd/']")
@@ -98,104 +100,4 @@ async def fetch_all_stores():
                     if "hot wheels" in text.lower() and "out of stock" not in text.lower():
                         a_tag = prod if prod.name == 'a' else prod.find('a', href=True)
                         href = a_tag.get('href', '') if a_tag else ''
-                        link = f"https://www.bigbasket.com{href}" if href.startswith('/') else href or bb_url
-                        prod_id_match = re.search(r'/pd/([0-9]+)', href)
-                        prod_id = prod_id_match.group(1) if prod_id_match else "bb_" + href.split('/')[-2]
-
-                        all_in_stock.append({
-                            "platform": "BigBasket",
-                            "id": prod_id,
-                            "title": text[:80],
-                            "price": "Check App",
-                            "link": link
-                        })
-        except Exception as e:
-            logging.error(f"[BigBasket] Error: {e}")
-
-        # --- 3. BLINKIT ---
-        try:
-            logging.info("[Blinkit] Querying search endpoint...")
-            blinkit_url = "https://blinkit.com/s/?q=hot%20wheels"
-            res = await client.get(blinkit_url, headers=headers)
-            if res.status_code in [200, 202]:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                items = soup.select("div[class*='Product'], a[href*='/prid/']")
-                for item in items:
-                    text = item.get_text(" ", strip=True)
-                    if "hot wheels" in text.lower() and "out of stock" not in text.lower():
-                        a_tag = item if item.name == 'a' else item.find('a', href=True)
-                        href = a_tag.get('href', '') if a_tag else ''
-                        link = f"https://blinkit.com{href}" if href.startswith('/') else href or blinkit_url
-                        prod_id_match = re.search(r'/prid/([0-9]+)', href)
-                        prod_id = prod_id_match.group(1) if prod_id_match else href.split('/')[-1]
-
-                        all_in_stock.append({
-                            "platform": "Blinkit",
-                            "id": prod_id,
-                            "title": text[:80],
-                            "price": "Check App",
-                            "link": link
-                        })
-        except Exception as e:
-            logging.error(f"[Blinkit] Error: {e}")
-
-        # --- 4. SWIGGY INSTAMART ---
-        try:
-            logging.info("[Instamart] Querying store inventory...")
-            instamart_url = "https://www.swiggy.com/instamart/search?query=hot%20wheels"
-            res = await client.get(instamart_url, headers=headers)
-            if res.status_code in [200, 202]:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                cards = soup.select("div[class*='ItemCard'], a[href*='/item/']")
-                for card in cards:
-                    text = card.get_text(" ", strip=True)
-                    if "hot wheels" in text.lower() and "out of stock" not in text.lower():
-                        a_tag = card if card.name == 'a' else card.find('a', href=True)
-                        href = a_tag.get('href', '') if a_tag else ''
-                        link = f"https://www.swiggy.com{href}" if href.startswith('/') else href or instamart_url
-                        prod_id = href.split('/')[-1] if href else "instamart_hw"
-
-                        all_in_stock.append({
-                            "platform": "Instamart",
-                            "id": prod_id,
-                            "title": text[:80],
-                            "price": "Check App",
-                            "link": link
-                        })
-        except Exception as e:
-            logging.error(f"[Instamart] Error: {e}")
-
-        # --- 5. ZEPTO ---
-        try:
-            logging.info("[Zepto] Querying catalog...")
-            zepto_url = "https://www.zeptonow.com/search?query=hot%20wheels"
-            res = await client.get(zepto_url, headers=headers)
-            if res.status_code in [200, 202]:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                cards = soup.select("a[href*='/pn/'], div[class*='productCard']")
-                for card in cards:
-                    text = card.get_text(" ", strip=True)
-                    if "hot wheels" in text.lower() and "out of stock" not in text.lower():
-                        a_tag = card if card.name == 'a' else card.find('a', href=True)
-                        href = a_tag.get('href', '') if a_tag else ''
-                        link = f"https://www.zeptonow.com{href}" if href.startswith('/') else href or zepto_url
-                        prod_id = href.split('/')[-1] if href else "zepto_hw"
-
-                        all_in_stock.append({
-                            "platform": "Zepto",
-                            "id": prod_id,
-                            "title": text[:80],
-                            "price": "Check App",
-                            "link": link
-                        })
-        except Exception as e:
-            logging.error(f"[Zepto] Error: {e}")
-
-    # Deduplicate results per run
-    unique_results = {}
-    for item in all_in_stock:
-        key = f"{item['platform']}_{item['id']}"
-        if key not in unique_results:
-            unique_results[key] = item
-
-    return list(unique_results.values())
+                        link = f"
