@@ -13,7 +13,7 @@ from playwright.async_api import async_playwright
 # ---------------------------------------------------------------------------
 # Delivery location (Chennai) + pincode used for stock availability.
 LOCATION = {"latitude": 13.0827, "longitude": 80.2707}
-PINCODE = os.getenv("PINCODE", "600045")
+PINCODE = os.getenv("PINCODE") or "600126"  # set the PINCODE secret in GitHub for your area
 
 # Which platforms to scan. GitHub Actions' US IPs are blocked by BigBasket, Blinkit,
 # Instamart and Zepto (see debug output), so only FirstCry is on by default.
