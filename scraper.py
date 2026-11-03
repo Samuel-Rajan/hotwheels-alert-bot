@@ -1,201 +1,207 @@
+import asyncio
+import hashlib
 import logging
-import httpx
-from bs4 import BeautifulSoup
 import re
+from pathlib import Path
+from urllib.parse import urljoin
+
 from playwright.async_api import async_playwright
 
-async def fetch_all_stores():
-    all_in_stock = []
-    
-    stealth_headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-        "x-location-context": "13.0827,80.2707",
+# Delivery location used for the quick-commerce sites (Chennai)
+LOCATION = {"latitude": 13.0827, "longitude": 80.2707}
+
+DEBUG_DIR = Path("debug")
+
+PLATFORMS = [
+    {
+        "name": "FirstCry",
+        "url": "https://www.firstcry.com/search?q=hot%20wheels&sort=newness",
+        "base": "https://www.firstcry.com",
+        "id_re": r"/(\d{5,})/product-detail",
+    },
+    {
+        "name": "BigBasket",
+        "url": "https://www.bigbasket.com/ps/?q=hot%20wheels&nc=as",
+        "base": "https://www.bigbasket.com",
+        "id_re": r"/pd/(\d+)",
+    },
+    {
+        "name": "Blinkit",
+        "url": "https://blinkit.com/s/?q=hot%20wheels",
+        "base": "https://blinkit.com",
+        "id_re": r"/prid/(\d+)",
+    },
+    {
+        "name": "Instamart",
+        "url": "https://www.swiggy.com/instamart/search?custom_back=true&query=hot%20wheels",
+        "base": "https://www.swiggy.com",
+        "id_re": r"/item/(\w+)",
+    },
+    {
+        "name": "Zepto",
+        "url": "https://www.zeptonow.com/search?query=hot%20wheels",
+        "base": "https://www.zeptonow.com",
+        "id_re": r"/pvid/([\w-]+)",
+    },
+]
+
+OOS_MARKERS = ["out of stock", "sold out", "notify me", "currently unavailable", "notify"]
+BLOCK_MARKERS = ["access denied", "captcha", "unusual traffic", "forbidden", "request blocked", "are you a robot"]
+
+PLATFORM_TIMEOUT = 70  # seconds per platform
+
+# Class-name independent extractor: finds every text node mentioning "hot wheels",
+# climbs up to the nearest ancestor that also shows a price, and treats it as a product card.
+EXTRACT_JS = """
+() => {
+  const KEY = "hot wheels";
+  const PRICE = /₹|Rs\\.?\\s?\\d|INR/;
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  const cards = new Set();
+  let n;
+  while ((n = walker.nextNode())) {
+    if (!n.nodeValue.toLowerCase().includes(KEY)) continue;
+    let el = n.parentElement;
+    for (let i = 0; el && i < 8; i++, el = el.parentElement) {
+      const t = el.innerText || "";
+      if (t.length > 600) break;
+      if (PRICE.test(t)) { cards.add(el); break; }
+    }
+  }
+  const arr = [...cards];
+  const inner = arr.filter(c => !arr.some(o => o !== c && c.contains(o)));
+  return inner.map(c => {
+    const a = c.tagName === "A" ? c : (c.querySelector("a[href]") || c.closest("a[href]"));
+    const img = c.querySelector("img");
+    return {
+      text: c.innerText || "",
+      href: a ? a.getAttribute("href") : "",
+      img: img ? (img.currentSrc || img.src || img.getAttribute("data-src") || "") : ""
+    };
+  });
+}
+"""
+
+
+def _parse_card(raw: dict, cfg: dict):
+    text = raw.get("text", "")
+    low = text.lower()
+    if "hot wheels" not in low:
+        return None
+    if any(m in low for m in OOS_MARKERS):
+        return None
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    title = next((l for l in lines if "hot wheels" in l.lower()), lines[0])[:120]
+
+    price_match = re.search(r"(₹|Rs\.?)\s?[\d,]+(\.\d+)?", text)
+    price = price_match.group(0) if price_match else "Check App"
+
+    href = raw.get("href") or ""
+    if href and not href.startswith(("javascript:", "#")):
+        link = urljoin(cfg["base"], href)
+    else:
+        link = cfg["url"]
+
+    id_match = re.search(cfg["id_re"], href or "")
+    if id_match:
+        prod_id = id_match.group(1)
+    else:
+        prod_id = "t_" + hashlib.sha1(title.lower().encode()).hexdigest()[:12]
+
+    img = raw.get("img") or ""
+    if img.startswith("//"):
+        img = "https:" + img
+    if not img.startswith("http"):
+        img = ""
+
+    return {
+        "platform": cfg["name"],
+        "id": prod_id,
+        "title": title,
+        "price": price,
+        "link": link,
+        "image": img,
     }
 
-    # ==========================================
-    # 1. FIRSTCRY (Playwright Headless Browser)
-    # ==========================================
+
+async def _scrape_platform(browser, device: dict, cfg: dict):
+    """Returns (platform_name, items, ok). ok=False means 'could not get a trustworthy scan'."""
+    name = cfg["name"]
+    ctx = await browser.new_context(
+        **device,
+        locale="en-IN",
+        timezone_id="Asia/Kolkata",
+        geolocation=LOCATION,
+        permissions=["geolocation"],
+    )
+    page = await ctx.new_page()
     try:
-        logging.info("[FirstCry] Launching headless browser for JS rendering...")
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
-                viewport={"width": 390, "height": 844},
-                locale="en-IN"
-            )
-            page = await context.new_page()
-            await page.goto("https://www.firstcry.com/search?q=hot%20wheels&sort=newness", timeout=15000)
-            
-            try:
-                await page.wait_for_selector("div[class*='product'], li[class*='product'], .prod-item, a[href*='/p/']", timeout=8000)
-            except Exception:
-                pass
+        logging.info(f"[{name}] Loading {cfg['url']}")
+        await page.goto(cfg["url"], timeout=30000, wait_until="domcontentloaded")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
 
-            cards = await page.locator("div[class*='product'], li[class*='product'], .prod-item, a[href*='/p/']").all()
-            for card in cards:
-                try:
-                    text = await card.inner_text()
-                    text_lower = text.lower()
-                    
-                    if "hot wheels" in text_lower and "out of stock" not in text_lower and "sold out" not in text_lower:
-                        link_elem = card if await card.evaluate("node => node.tagName === 'A'") else card.locator("a[href]").first
-                        href = await link_elem.get_attribute("href") if await link_elem.count() > 0 else ""
-                        
-                        if not href or href == "#" or href.startswith("javascript:"):
-                            continue
+        # scroll to trigger lazy loading
+        for _ in range(4):
+            await page.mouse.wheel(0, 1800)
+            await page.wait_for_timeout(800)
 
-                        link = href if href.startswith("http") else f"https://www.firstcry.com{href}"
-                        prod_id = link.split('?')[0].split('/')[-1]
+        body = (await page.inner_text("body")).lower()
+        if len(body) < 300 or any(m in body for m in BLOCK_MARKERS):
+            logging.warning(f"[{name}] Page looks blocked/empty (len={len(body)})")
+            await _debug_dump(page, name)
+            return name, [], False
 
-                        if not prod_id or len(prod_id) < 2:
-                            continue
-
-                        price = "Check App"
-                        for word in text.split():
-                            if "₹" in word or "INR" in word:
-                                price = word
-                                break
-
-                        all_in_stock.append({
-                            "platform": "FirstCry",
-                            "id": prod_id,
-                            "title": text.replace("\n", " ")[:80],
-                            "price": price,
-                            "link": link
-                        })
-                except Exception:
-                    continue
-            await browser.close()
+        raw_cards = await page.evaluate(EXTRACT_JS)
+        items = [i for i in (_parse_card(r, cfg) for r in raw_cards) if i]
+        logging.info(f"[{name}] {len(raw_cards)} Hot Wheels cards, {len(items)} in stock")
+        if not raw_cards:
+            await _debug_dump(page, name)
+        return name, items, True
     except Exception as e:
-        logging.error(f"[FirstCry Playwright] Error: {e}")
-
-    # ==========================================
-    # QUICK-COMMERCE APPS (HTTPX with Stealth Headers)
-    # ==========================================
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, http2=True) as client:
-        
-        # --- 2. BIGBASKET ---
+        logging.error(f"[{name}] Error: {e}")
         try:
-            logging.info("[BigBasket] Querying catalog search...")
-            bb_url = "https://www.bigbasket.com/search/?slug=hot%20wheels"
-            res = await client.get(bb_url, headers=stealth_headers)
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                products = soup.select("div[qa='productCard'], div[class*='ProductCard'], a[href*='/pd/']")
-                for prod in products:
-                    text = prod.get_text(" ", strip=True)
-                    if "hot wheels" in text.lower() and "out of stock" not in text.lower():
-                        a_tag = prod if prod.name == 'a' else prod.find('a', href=True)
-                        href = a_tag.get('href', '') if a_tag else ''
-                        link = f"https://www.bigbasket.com{href}" if href.startswith('/') else href or bb_url
-                        prod_id_match = re.search(r'/pd/([0-9]+)', href)
-                        prod_id = prod_id_match.group(1) if prod_id_match else "bb_" + href.split('/')[-2]
+            await _debug_dump(page, name)
+        except Exception:
+            pass
+        return name, [], False
+    finally:
+        await ctx.close()
 
-                        all_in_stock.append({
-                            "platform": "BigBasket",
-                            "id": prod_id,
-                            "title": text[:80],
-                            "price": "Check App",
-                            "link": link
-                        })
-        except Exception as e:
-            logging.error(f"[BigBasket] Error: {e}")
 
-        # --- 3. BLINKIT ---
+async def _debug_dump(page, name: str):
+    DEBUG_DIR.mkdir(exist_ok=True)
+    await page.screenshot(path=str(DEBUG_DIR / f"{name}.png"), full_page=False)
+
+
+async def _guarded(browser, device, cfg):
+    try:
+        return await asyncio.wait_for(_scrape_platform(browser, device, cfg), timeout=PLATFORM_TIMEOUT)
+    except asyncio.TimeoutError:
+        logging.error(f"[{cfg['name']}] Timed out")
+        return cfg["name"], [], False
+
+
+async def fetch_all_stores():
+    """Returns (items_in_stock, set_of_platforms_scanned_successfully)."""
+    all_items, ok_platforms = [], set()
+    async with async_playwright() as p:
+        device = dict(p.devices["iPhone 13"])
+        browser = await p.chromium.launch(headless=True)
         try:
-            logging.info("[Blinkit] Querying search endpoint...")
-            blinkit_url = "https://blinkit.com/s/?q=hot%20wheels"
-            res = await client.get(blinkit_url, headers=stealth_headers)
-            if res.status_code in [200, 202]:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                items = soup.select("div[class*='Product'], a[href*='/prid/']")
-                for item in items:
-                    text = item.get_text(" ", strip=True)
-                    if "hot wheels" in text.lower() and "out of stock" not in text.lower():
-                        a_tag = item if item.name == 'a' else item.find('a', href=True)
-                        href = a_tag.get('href', '') if a_tag else ''
-                        link = f"https://blinkit.com{href}" if href.startswith('/') else href or blinkit_url
-                        prod_id_match = re.search(r'/prid/([0-9]+)', href)
-                        prod_id = prod_id_match.group(1) if prod_id_match else href.split('/')[-1]
+            results = await asyncio.gather(*[_guarded(browser, device, cfg) for cfg in PLATFORMS])
+        finally:
+            await browser.close()
 
-                        all_in_stock.append({
-                            "platform": "Blinkit",
-                            "id": prod_id,
-                            "title": text[:80],
-                            "price": "Check App",
-                            "link": link
-                        })
-        except Exception as e:
-            logging.error(f"[Blinkit] Error: {e}")
+    for name, items, ok in results:
+        if ok:
+            ok_platforms.add(name)
+        all_items.extend(items)
 
-        # --- 4. SWIGGY INSTAMART ---
-        try:
-            logging.info("[Instamart] Querying store inventory...")
-            instamart_url = "https://www.swiggy.com/instamart/search?query=hot%20wheels"
-            res = await client.get(instamart_url, headers=stealth_headers)
-            if res.status_code in [200, 202]:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                cards = soup.select("div[class*='ItemCard'], a[href*='/item/']")
-                for card in cards:
-                    text = card.get_text(" ", strip=True)
-                    if "hot wheels" in text.lower() and "out of stock" not in text.lower():
-                        a_tag = card if card.name == 'a' else card.find('a', href=True)
-                        href = a_tag.get('href', '') if a_tag else ''
-                        link = f"https://www.swiggy.com{href}" if href.startswith('/') else href or instamart_url
-                        prod_id = href.split('/')[-1] if href else "instamart_hw"
-
-                        all_in_stock.append({
-                            "platform": "Instamart",
-                            "id": prod_id,
-                            "title": text[:80],
-                            "price": "Check App",
-                            "link": link
-                        })
-        except Exception as e:
-            logging.error(f"[Instamart] Error: {e}")
-
-        # --- 5. ZEPTO ---
-        try:
-            logging.info("[Zepto] Querying catalog...")
-            zepto_url = "https://www.zeptonow.com/search?query=hot%20wheels"
-            res = await client.get(zepto_url, headers=stealth_headers)
-            if res.status_code in [200, 202]:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                cards = soup.select("a[href*='/pn/'], div[class*='productCard']")
-                for card in cards:
-                    text = card.get_text(" ", strip=True)
-                    if "hot wheels" in text.lower() and "out of stock" not in text.lower():
-                        a_tag = card if card.name == 'a' else card.find('a', href=True)
-                        href = a_tag.get('href', '') if a_tag else ''
-                        link = f"https://www.zeptonow.com{href}" if href.startswith('/') else href or zepto_url
-                        prod_id = href.split('/')[-1] if href else "zepto_hw"
-
-                        all_in_stock.append({
-                            "platform": "Zepto",
-                            "id": prod_id,
-                            "title": text[:80],
-                            "price": "Check App",
-                            "link": link
-                        })
-        except Exception as e:
-            logging.error(f"[Zepto] Error: {e}")
-
-    unique_results = {}
-    for item in all_in_stock:
-        key = f"{item['platform']}_{item['id']}"
-        if key not in unique_results:
-            unique_results[key] = item
-
-    return list(unique_results.values())
+    unique = {}
+    for it in all_items:
+        unique.setdefault(f"{it['platform']}_{it['id']}", it)
+    return list(unique.values()), ok_platforms
