@@ -28,7 +28,6 @@ PLATFORMS = [
         "name": "FirstCry",
         # Brand listing pages (server-rendered, only Hot Wheels items) instead of fuzzy search.
         "urls": [
-            "https://www.firstcry.com/hot-wheels/toy-cars,-trains-and-vehicles/5/94/113",
             "https://www.firstcry.com/hot-wheels/5/0/113",
             "https://www.firstcry.com/hot-wheels-by-mattel/toy-cars-trains-and-vehicles/5/94/1011464",
         ],
@@ -74,14 +73,14 @@ BLOCK_MARKERS = ["access denied", "captcha", "unusual traffic", "forbidden", "re
                  "are you a robot", "you have been blocked", "we'll be back shortly"]
 NO_RESULT_MARKERS = ["no results", "no products found", "couldn't find", "could not find",
                      "no items found", "0 results", "0 items"]
-NOISE_LINE = re.compile(r"^(ad|bestseller|new|sponsored|\d+% off|club price.*|\(.*\)|[\d.,\s₹]+)$", re.I)
+NOISE_LINE = re.compile(r"^(ad|bestseller|new|international|sponsored|get it by.*|\d+% off|club price.*|\(.*\)|[\d.,\s₹]+)$", re.I)
 
 # Class-name independent extractor. A "card" is any product link (matched by URL pattern) or any
 # price-bearing block, whose text / image alt / link URL mentions Hot Wheels.
 EXTRACT_JS = """
 ({linkSel, keyRe}) => {
   const kre = new RegExp(keyRe, "i");
-  const PRICE = /₹|Rs\\.?\\s?\\d|INR/;
+  const PRICE = /₹|Rs\\.?\\s?\\d|INR|Club Price/;
   const cards = new Set();
 
   // Pass 1: text nodes mentioning the keyword -> nearest ancestor with a price
@@ -147,12 +146,17 @@ def _parse_card(raw: dict, cfg: dict):
         title = alt.strip() or (clean[0] if clean else "Hot Wheels")
     title = title[:120]
 
+    price = "Check App"
     price_match = re.search(r"(₹|Rs\.?)\s?[\d,]+(\.\d+)?", text)
     if price_match:
         price = price_match.group(0)
     else:
-        nums = re.findall(r"^\s*(\d[\d,]*(?:\.\d+)?)\s*$", text, re.M)
-        price = f"₹{nums[0]}" if nums else "Check App"
+        start = lines.index(title) + 1 if title in lines else 0
+        for l in lines[start:]:
+            m = re.match(r"^(\d[\d,]*(?:\.\d+)?)(\s|$)", l)
+            if m:
+                price = f"₹{m.group(1)}"
+                break
 
     if href and not href.startswith(("javascript:", "#")):
         link = urljoin(cfg["base"], href)
@@ -201,20 +205,21 @@ async def _set_pincode(page, name: str) -> bool:
         return False
 
 
-async def _load_all(page, link_sel: str, max_rounds: int = 14):
-    """Scroll until the number of product links stops growing."""
-    sel = f"a[href*='{link_sel}']"
+async def _load_all(page, link_sel: str, max_rounds: int = 25):
+    """Scroll until the number of Hot Wheels mentions on the page stops growing."""
+    js = "(re) => (document.body.innerText.match(new RegExp(re, 'gi')) || []).length"
     last, stable = 0, 0
     for _ in range(max_rounds):
-        cnt = await page.locator(sel).count()
+        cnt = await page.evaluate(js, KEY_RE)
         if cnt == last:
             stable += 1
-            if stable >= 2:
+            if stable >= 3:
                 break
         else:
             stable, last = 0, cnt
-        await page.mouse.wheel(0, 2500)
+        await page.mouse.wheel(0, 3000)
         await page.wait_for_timeout(1000)
+    logging.info(f"Scrolled; ~{last} Hot Wheels mentions loaded")
 
 
 async def _scrape_platform(browser, device: dict, cfg: dict):
