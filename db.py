@@ -70,10 +70,15 @@ def check_item(key: str, platform: str, title: str, link: str) -> bool:
             return True
 
         was_out = row[0] == "out"
-        c.execute(
-            "UPDATE inventory SET status='in', miss_count=0, title=?, link=?, last_seen=? WHERE key=?",
-            (title, link, now, key),
-        )
+        if was_out:
+            c.execute(
+                "UPDATE inventory SET status='in', miss_count=0, title=?, link=?, last_seen=? WHERE key=?",
+                (title, link, now, key),
+            )
+        else:
+            # Still in stock: only touch the DB if a miss counter needs resetting.
+            # No write => inventory.db stays byte-identical => no commit noise.
+            c.execute("UPDATE inventory SET miss_count=0 WHERE key=? AND miss_count<>0", (key,))
         return was_out
 
 
