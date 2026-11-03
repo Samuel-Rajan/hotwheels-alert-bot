@@ -91,6 +91,6 @@ if __name__ == "__main__":
         print("⚠️ Telegram credentials missing from environment variables!")
         raise SystemExit(1)
     try:
-        asyncio.run(asyncio.wait_for(monitor_stock(), timeout=240.0))
+        asyncio.run(asyncio.wait_for(monitor_stock(), timeout=420.0))
     except asyncio.TimeoutError:
-        logging.error("❌ Execution timed out after 240 seconds and was aborted.")
+        logging.error("❌ Execution timed out after 420 seconds and was aborted.")
