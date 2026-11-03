@@ -7,7 +7,7 @@ from telegram import Bot
 from telegram.constants import ParseMode
 
 from scraper import fetch_all_stores
-from db import init_db, is_empty, check_item, mark_missing
+from db import init_db, is_first_run, mark_seeded, check_item, mark_missing
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -48,7 +48,7 @@ async def send_stock_alert(bot: Bot, item: dict):
 async def monitor_stock():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     init_db()
-    first_run = is_empty()
+    first_run = is_first_run()
     logging.info("Checking all platforms for Hot Wheels stock & new releases...")
 
     items, ok_platforms = await fetch_all_stores()
@@ -75,7 +75,9 @@ async def monitor_stock():
     for platform in ok_platforms:
         mark_missing(platform, seen.get(platform, set()))
 
-    if first_run:
+    # Seed silently on the first run that actually finds products
+    if first_run and items:
+        mark_seeded()
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=f"✅ Hot Wheels bot is live. Tracking {len(items)} in-stock items right now. "
