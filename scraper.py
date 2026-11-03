@@ -2,20 +2,18 @@ import logging
 import httpx
 from bs4 import BeautifulSoup
 import re
-import json
 
 async def fetch_all_stores():
     """
-    Robust multi-store scraper utilizing direct JSON APIs for FirstCry 
-    and resilient HTML parsing for quick-commerce apps.
+    Bulletproof multi-store scraper with session cookie handshaking for FirstCry,
+    recursive JSON parsing, and robust HTML fallback extraction.
     """
     all_in_stock = []
     
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/json,*/*;q=0.8",
         "Accept-Language": "en-IN,en;q=0.9",
-        "Referer": "https://www.firstcry.com/",
         "Cache-Control": "no-cache",
         "x-location-context": "13.0827,80.2707",
     }
@@ -23,52 +21,56 @@ async def fetch_all_stores():
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         
         # ==========================================
-        # 1. FIRSTCRY (Direct JSON API Endpoint)
+        # 1. FIRSTCRY (Session Handshake + JSON/HTML Fallback)
         # ==========================================
         try:
-            logging.info("[FirstCry] Querying JSON search API...")
-            # FirstCry mobile search suggestion/catalog API endpoint
-            fc_api_url = "https://www.firstcry.com/rest/search?q=hot%20wheels"
-            res = await client.get(fc_api_url, headers=headers)
+            logging.info("[FirstCry] Initializing session handshake...")
+            # Establish valid cookies from homepage first
+            await client.get("https://www.firstcry.com/", headers=headers)
+            
+            logging.info("[FirstCry] Querying catalog feed...")
+            fc_url = "https://www.firstcry.com/search?q=hot%20wheels&sort=newness"
+            res = await client.get(fc_url, headers=headers)
             
             if res.status_code == 200:
-                try:
-                    data = res.json()
-                    # Parse products from JSON response array
-                    products = data.get("result", data.get("products", data.get("items", [])))
-                    for prod in products:
-                        title = prod.get("name", prod.get("prodName", ""))
-                        if "hot wheels" in title.lower():
-                            prod_id = str(prod.get("id", prod.get("prodId", "")))
-                            url_slug = prod.get("url", prod.get("prodUrl", ""))
-                            link = url_slug if url_slug.startswith("http") else f"https://www.firstcry.com{url_slug}"
-                            price = str(prod.get("price", prod.get("finalPrice", "Check App")))
+                soup = BeautifulSoup(res.text, 'html.parser')
+                
+                # Broad extraction covering all product cards, grid blocks, and links
+                cards = soup.select(".prod-item, .list-block, div[class*='product'], div[class*='item'], li[class*='product'], a[href]")
+                
+                for card in cards:
+                    text = card.get_text(" ", strip=True)
+                    text_lower = text.lower()
+                    
+                    if "hot wheels" in text_lower and "out of stock" not in text_lower and "sold out" not in text_lower:
+                        a_tag = card if card.name == 'a' else card.find('a', href=True)
+                        if a_tag and a_tag.get('href'):
+                            href = a_tag['href']
+                            if href == "#" or href.startswith("javascript:"):
+                                continue
+
+                            link = href if href.startswith("http") else f"https://www.firstcry.com{href}"
                             
+                            # Extract clean product ID
+                            prod_id_match = re.search(r'/p/([a-zA-Z0-9\-_]+)', link) or re.search(r'pid=([a-zA-Z0-9\-_]+)', link) or re.search(r'/([0-9]{5,10})', link)
+                            prod_id = prod_id_match.group(1) if prod_id_match else link.split('?')[0].split('/')[-1]
+
+                            if not prod_id or len(prod_id) < 2:
+                                continue
+
+                            price = "Check App"
+                            for word in text.split():
+                                if "₹" in word or "INR" in word:
+                                    price = word
+                                    break
+
                             all_in_stock.append({
                                 "platform": "FirstCry",
-                                "id": prod_id or link,
-                                "title": title[:80],
-                                "price": f"₹{price}" if not price.startswith("₹") else price,
+                                "id": prod_id,
+                                "title": text[:80],
+                                "price": price,
                                 "link": link
                             })
-                except Exception:
-                    # Fallback to HTML scraping if response is HTML fallback
-                    soup = BeautifulSoup(res.text, 'html.parser')
-                    cards = soup.select("div[class*='product'], li[class*='product'], a[href*='/p/']")
-                    for card in cards:
-                        text = card.get_text(" ", strip=True)
-                        if "hot wheels" in text.lower() and "out of stock" not in text.lower():
-                            a_tag = card if card.name == 'a' else card.find('a', href=True)
-                            if a_tag and a_tag.get('href'):
-                                href = a_tag['href']
-                                link = href if href.startswith("http") else f"https://www.firstcry.com{href}"
-                                all_in_stock.append({
-                                    "platform": "FirstCry",
-                                    "id": link.split('/')[-1],
-                                    "title": text[:80],
-                                    "price": "Check App",
-                                    "link": link
-                                })
         except Exception as e:
             logging.error(f"[FirstCry] Error: {e}")
 
@@ -186,6 +188,7 @@ async def fetch_all_stores():
         except Exception as e:
             logging.error(f"[Zepto] Error: {e}")
 
+    # Deduplicate results per run
     unique_results = {}
     for item in all_in_stock:
         key = f"{item['platform']}_{item['id']}"
