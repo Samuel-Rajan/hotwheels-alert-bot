@@ -73,4 +73,8 @@ if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram credentials missing from environment variables!")
     else:
-        asyncio.run(monitor_stock())
+        try:
+            # Force script to timeout safely after 30 seconds if any store connection hangs
+            asyncio.run(asyncio.wait_for(monitor_stock(), timeout=30.0))
+        except asyncio.TimeoutError:
+            logging.error("❌ Execution timed out after 30 seconds and was safely aborted.")
