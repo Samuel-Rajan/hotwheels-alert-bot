@@ -1,74 +1,94 @@
 import asyncio
 import hashlib
 import logging
+import os
 import re
 from pathlib import Path
 from urllib.parse import urljoin
 
 from playwright.async_api import async_playwright
 
-# Delivery location used for the quick-commerce sites (Chennai)
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+# Delivery location (Chennai) + pincode used for stock availability.
 LOCATION = {"latitude": 13.0827, "longitude": 80.2707}
+PINCODE = os.getenv("PINCODE", "600045")
+
+# Which platforms to scan. GitHub Actions' US IPs are blocked by BigBasket, Blinkit,
+# Instamart and Zepto (see debug output), so only FirstCry is on by default.
+# On a machine with an Indian IP you can run:  PLATFORMS=all python main.py
+ENABLED = [p.strip().lower() for p in os.getenv("PLATFORMS", "firstcry").split(",") if p.strip()]
 
 DEBUG_DIR = Path("debug")
+PLATFORM_TIMEOUT = 150  # seconds per platform
 
 PLATFORMS = [
     {
         "name": "FirstCry",
-        "url": "https://www.firstcry.com/search?q=hot%20wheels&sort=newness",
+        # Brand listing pages (server-rendered, only Hot Wheels items) instead of fuzzy search.
+        "urls": [
+            "https://www.firstcry.com/hot-wheels/toy-cars,-trains-and-vehicles/5/94/113",
+            "https://www.firstcry.com/hot-wheels/5/0/113",
+            "https://www.firstcry.com/hot-wheels-by-mattel/toy-cars-trains-and-vehicles/5/94/1011464",
+        ],
         "base": "https://www.firstcry.com",
-        "id_re": r"/(\d{5,})/product-detail",
-        "link_re": r"product-detail",
+        "id_re": r"/([0-9a-zA-Z]{5,})/product-detail",
+        "link_sel": "product-detail",
+        "set_pincode": True,
     },
     {
         "name": "BigBasket",
-        "url": "https://www.bigbasket.com/ps/?q=hot%20wheels&nc=as",
+        "urls": ["https://www.bigbasket.com/ps/?q=hot%20wheels&nc=as"],
         "base": "https://www.bigbasket.com",
         "id_re": r"/pd/(\d+)",
-        "link_re": r"/pd/",
+        "link_sel": "/pd/",
     },
     {
         "name": "Blinkit",
-        "url": "https://blinkit.com/s/?q=hot%20wheels",
+        "urls": ["https://blinkit.com/s/?q=hot%20wheels"],
         "base": "https://blinkit.com",
         "id_re": r"/prid/(\d+)",
-        "link_re": r"/prid/",
+        "link_sel": "/prid/",
     },
     {
         "name": "Instamart",
-        "url": "https://www.swiggy.com/instamart/search?custom_back=true&query=hot%20wheels",
+        "urls": ["https://www.swiggy.com/instamart/search?custom_back=true&query=hot%20wheels"],
         "base": "https://www.swiggy.com",
         "id_re": r"/item/(\w+)",
-        "link_re": r"/item/",
+        "link_sel": "/item/",
     },
     {
         "name": "Zepto",
-        "url": "https://www.zeptonow.com/search?query=hot%20wheels",
+        "urls": ["https://www.zeptonow.com/search?query=hot%20wheels"],
         "base": "https://www.zeptonow.com",
         "id_re": r"/pvid/([\w-]+)",
-        "link_re": r"/pn/",
+        "link_sel": "/pn/",
     },
 ]
 
+KEY_RE = r"hot.?wheels"  # matches "hot wheels", "hot-wheels", "hotwheels"
+
 OOS_MARKERS = ["out of stock", "sold out", "notify me", "currently unavailable", "notify"]
-BLOCK_MARKERS = ["access denied", "captcha", "unusual traffic", "forbidden", "request blocked", "are you a robot"]
-NO_RESULT_MARKERS = ["no results", "no products found", "couldn't find", "could not find", "no items found", "0 results"]
+BLOCK_MARKERS = ["access denied", "captcha", "unusual traffic", "forbidden", "request blocked",
+                 "are you a robot", "you have been blocked", "we'll be back shortly"]
+NO_RESULT_MARKERS = ["no results", "no products found", "couldn't find", "could not find",
+                     "no items found", "0 results", "0 items"]
+NOISE_LINE = re.compile(r"^(ad|bestseller|new|sponsored|\d+% off|club price.*|\(.*\)|[\d.,\s₹]+)$", re.I)
 
-PLATFORM_TIMEOUT = 70  # seconds per platform
-
-# Class-name independent extractor.
-# Pass 1: text nodes mentioning "hot wheels" -> climb to nearest ancestor that shows a price.
-# Pass 2: product links (by URL pattern) whose card text or image alt mentions "hot wheels".
+# Class-name independent extractor. A "card" is any product link (matched by URL pattern) or any
+# price-bearing block, whose text / image alt / link URL mentions Hot Wheels.
 EXTRACT_JS = """
-(linkRe) => {
-  const KEY = "hot wheels";
+({linkSel, keyRe}) => {
+  const kre = new RegExp(keyRe, "i");
   const PRICE = /₹|Rs\\.?\\s?\\d|INR/;
   const cards = new Set();
 
+  // Pass 1: text nodes mentioning the keyword -> nearest ancestor with a price
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   let n;
   while ((n = walker.nextNode())) {
-    if (!n.nodeValue.toLowerCase().includes(KEY)) continue;
+    if (!kre.test(n.nodeValue)) continue;
     let el = n.parentElement;
     for (let i = 0; el && i < 8; i++, el = el.parentElement) {
       const t = el.innerText || "";
@@ -77,9 +97,10 @@ EXTRACT_JS = """
     }
   }
 
-  const re = new RegExp(linkRe);
+  // Pass 2: product links; keyword may be in the text, image alt, or the URL path itself
   document.querySelectorAll("a[href]").forEach(a => {
-    if (!re.test(a.getAttribute("href") || "")) return;
+    const href = a.getAttribute("href") || "";
+    if (!href.includes(linkSel)) return;
     let el = a;
     for (let i = 0; i < 4 && el.parentElement; i++) {
       const t = el.innerText || "";
@@ -87,9 +108,9 @@ EXTRACT_JS = """
       if ((el.parentElement.innerText || "").length > 600) break;
       el = el.parentElement;
     }
-    const alt = [...el.querySelectorAll("img")].map(i => i.alt || i.title || "").join(" ");
-    const hay = ((el.innerText || "") + " " + alt + " " + (a.getAttribute("title") || "")).toLowerCase();
-    if (hay.includes(KEY)) cards.add(el);
+    const alt = [...el.querySelectorAll("img")].map(i => (i.alt || "") + " " + (i.title || "")).join(" ");
+    const hay = (el.innerText || "") + " " + alt + " " + (a.getAttribute("title") || "") + " " + href;
+    if (kre.test(hay)) cards.add(el);
   });
 
   const arr = [...cards];
@@ -98,7 +119,7 @@ EXTRACT_JS = """
     const a = c.tagName === "A" ? c : (c.querySelector("a[href]") || c.closest("a[href]"));
     const img = c.querySelector("img");
     return {
-      text: (c.innerText || ""),
+      text: c.innerText || "",
       alt: img ? (img.alt || "") : "",
       href: a ? a.getAttribute("href") : "",
       img: img ? (img.currentSrc || img.src || img.getAttribute("data-src") || "") : ""
@@ -111,32 +132,35 @@ EXTRACT_JS = """
 def _parse_card(raw: dict, cfg: dict):
     text = raw.get("text", "")
     alt = raw.get("alt", "")
-    low = (text + " " + alt).lower()
-    if "hot wheels" not in low:
+    href = raw.get("href") or ""
+    low = text.lower()
+
+    if not re.search(KEY_RE, f"{text} {alt} {href}", re.I):
         return None
     if any(m in low for m in OOS_MARKERS):
         return None
 
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    title = next((l for l in lines if "hot wheels" in l.lower()), None)
+    clean = [l for l in lines if not NOISE_LINE.match(l)]
+    title = next((l for l in clean if re.search(KEY_RE, l, re.I)), None)
     if not title:
-        title = alt.strip() or (lines[0] if lines else "Hot Wheels")
+        title = alt.strip() or (clean[0] if clean else "Hot Wheels")
     title = title[:120]
 
     price_match = re.search(r"(₹|Rs\.?)\s?[\d,]+(\.\d+)?", text)
-    price = price_match.group(0) if price_match else "Check App"
+    if price_match:
+        price = price_match.group(0)
+    else:
+        nums = re.findall(r"^\s*(\d[\d,]*(?:\.\d+)?)\s*$", text, re.M)
+        price = f"₹{nums[0]}" if nums else "Check App"
 
-    href = raw.get("href") or ""
     if href and not href.startswith(("javascript:", "#")):
         link = urljoin(cfg["base"], href)
     else:
-        link = cfg["url"]
+        link = cfg["urls"][0]
 
-    id_match = re.search(cfg["id_re"], href or "")
-    if id_match:
-        prod_id = id_match.group(1)
-    else:
-        prod_id = "t_" + hashlib.sha1(title.lower().encode()).hexdigest()[:12]
+    id_match = re.search(cfg["id_re"], href)
+    prod_id = id_match.group(1) if id_match else "t_" + hashlib.sha1(title.lower().encode()).hexdigest()[:12]
 
     img = raw.get("img") or ""
     if img.startswith("//"):
@@ -144,14 +168,7 @@ def _parse_card(raw: dict, cfg: dict):
     if not img.startswith("http"):
         img = ""
 
-    return {
-        "platform": cfg["name"],
-        "id": prod_id,
-        "title": title,
-        "price": price,
-        "link": link,
-        "image": img,
-    }
+    return {"platform": cfg["name"], "id": prod_id, "title": title, "price": price, "link": link, "image": img}
 
 
 async def _debug_dump(page, name: str):
@@ -159,9 +176,45 @@ async def _debug_dump(page, name: str):
     try:
         await page.screenshot(path=str(DEBUG_DIR / f"{name}.png"), full_page=False)
         text = await page.inner_text("body")
-        (DEBUG_DIR / f"{name}.txt").write_text(text[:5000], encoding="utf-8")
+        (DEBUG_DIR / f"{name}.txt").write_text(text[:6000], encoding="utf-8")
     except Exception as e:
         logging.warning(f"[{name}] debug dump failed: {e}")
+
+
+async def _set_pincode(page, name: str) -> bool:
+    """Best-effort: open FirstCry's location picker and enter a pincode."""
+    try:
+        trigger = page.get_by_text(re.compile(r"select a location|deliver to|enter pincode", re.I)).first
+        await trigger.click(timeout=4000)
+        inp = page.locator("input[placeholder*='pin' i], input[id*='pin' i], input[name*='pin' i], input[type='tel']").first
+        await inp.fill(PINCODE, timeout=4000)
+        await inp.press("Enter")
+        try:
+            await page.get_by_role("button", name=re.compile(r"apply|check|submit|update", re.I)).first.click(timeout=2000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(3000)
+        logging.info(f"[{name}] Pincode {PINCODE} submitted")
+        return True
+    except Exception as e:
+        logging.warning(f"[{name}] Could not set pincode: {e}")
+        return False
+
+
+async def _load_all(page, link_sel: str, max_rounds: int = 14):
+    """Scroll until the number of product links stops growing."""
+    sel = f"a[href*='{link_sel}']"
+    last, stable = 0, 0
+    for _ in range(max_rounds):
+        cnt = await page.locator(sel).count()
+        if cnt == last:
+            stable += 1
+            if stable >= 2:
+                break
+        else:
+            stable, last = 0, cnt
+        await page.mouse.wheel(0, 2500)
+        await page.wait_for_timeout(1000)
 
 
 async def _scrape_platform(browser, device: dict, cfg: dict):
@@ -175,45 +228,47 @@ async def _scrape_platform(browser, device: dict, cfg: dict):
         permissions=["geolocation"],
     )
     page = await ctx.new_page()
+    items, all_ok = [], True
     try:
-        logging.info(f"[{name}] Loading {cfg['url']}")
-        await page.goto(cfg["url"], timeout=30000, wait_until="domcontentloaded")
-        try:
-            await page.wait_for_load_state("networkidle", timeout=12000)
-        except Exception:
-            pass
+        for idx, url in enumerate(cfg["urls"]):
+            logging.info(f"[{name}] Loading {url}")
+            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
 
-        # wait for product links to show up, then scroll to trigger lazy loading
-        try:
-            await page.wait_for_selector(f"a[href*='{cfg['link_re'].strip('/')}']", timeout=8000)
-        except Exception:
-            pass
-        for _ in range(5):
-            await page.mouse.wheel(0, 1800)
-            await page.wait_for_timeout(900)
+            if idx == 0 and cfg.get("set_pincode"):
+                if await _set_pincode(page, name):
+                    await page.reload(wait_until="domcontentloaded")
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
 
-        body = (await page.inner_text("body")).lower()
-        if len(body) < 300 or any(m in body for m in BLOCK_MARKERS):
-            logging.warning(f"[{name}] Page looks blocked/empty (len={len(body)})")
-            await _debug_dump(page, name)
-            return name, [], False
+            await _load_all(page, cfg["link_sel"])
 
-        raw_cards = await page.evaluate(EXTRACT_JS, cfg["link_re"])
-        items = [i for i in (_parse_card(r, cfg) for r in raw_cards) if i]
-        logging.info(f"[{name}] {len(raw_cards)} Hot Wheels cards, {len(items)} in stock")
+            body = (await page.inner_text("body")).lower()
+            if len(body) < 300 or any(m in body for m in BLOCK_MARKERS):
+                logging.warning(f"[{name}] {url} looks blocked/empty (len={len(body)})")
+                await _debug_dump(page, f"{name}_{idx}")
+                all_ok = False
+                continue
 
-        if not raw_cards:
-            await _debug_dump(page, name)
-            # Zero cards is only trustworthy if the site explicitly says "no results".
-            if any(m in body for m in NO_RESULT_MARKERS):
-                return name, [], True
-            logging.warning(f"[{name}] 0 cards and no 'no results' message -> treating scan as failed")
-            return name, [], False
+            raw_cards = await page.evaluate(EXTRACT_JS, {"linkSel": cfg["link_sel"], "keyRe": KEY_RE})
+            parsed = [i for i in (_parse_card(r, cfg) for r in raw_cards) if i]
+            logging.info(f"[{name}] page {idx}: {len(raw_cards)} Hot Wheels cards, {len(parsed)} in stock")
+            await _debug_dump(page, f"{name}_{idx}")   # always saved so you can verify what the bot saw
+            items.extend(parsed)
 
-        return name, items, True
+            if not raw_cards and not any(m in body for m in NO_RESULT_MARKERS):
+                logging.warning(f"[{name}] page {idx}: 0 cards and no 'no results' message -> scan failed")
+                all_ok = False
+
+        return name, items, all_ok
     except Exception as e:
         logging.error(f"[{name}] Error: {e}")
-        await _debug_dump(page, name)
+        await _debug_dump(page, f"{name}_error")
         return name, [], False
     finally:
         await ctx.close()
@@ -229,12 +284,15 @@ async def _guarded(browser, device, cfg):
 
 async def fetch_all_stores():
     """Returns (items_in_stock, set_of_platforms_scanned_successfully)."""
+    selected = [c for c in PLATFORMS if "all" in ENABLED or c["name"].lower() in ENABLED]
+    logging.info(f"Platforms enabled: {[c['name'] for c in selected]}")
+
     all_items, ok_platforms = [], set()
     async with async_playwright() as p:
         device = dict(p.devices["iPhone 13"])
         browser = await p.chromium.launch(headless=True)
         try:
-            results = await asyncio.gather(*[_guarded(browser, device, cfg) for cfg in PLATFORMS])
+            results = await asyncio.gather(*[_guarded(browser, device, cfg) for cfg in selected])
         finally:
             await browser.close()
 
