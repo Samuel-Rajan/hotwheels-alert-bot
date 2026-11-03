@@ -1,58 +1,93 @@
 import sqlite3
-from datetime import datetime, timedelta
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+DB_PATH = Path(__file__).parent / "inventory.db"
+
+# An item must be missing from this many consecutive successful scans
+# before it is considered "out of stock". Protects against flaky scrapes
+# causing fake restock alerts.
+MISS_THRESHOLD = 2
+
+
+@contextmanager
+def _conn():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
 
 def init_db():
-    """Initializes SQLite database to track active inventory with TTL support for restocks."""
-    conn = sqlite3.connect("inventory.db")
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS active_inventory (
-            platform_id TEXT PRIMARY KEY,
-            platform TEXT,
-            title TEXT,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    with _conn() as c:
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inventory (
+                key        TEXT PRIMARY KEY,
+                platform   TEXT NOT NULL,
+                title      TEXT,
+                link       TEXT,
+                status     TEXT NOT NULL DEFAULT 'in',   -- 'in' or 'out'
+                miss_count INTEGER NOT NULL DEFAULT 0,
+                first_seen TEXT,
+                last_seen  TEXT
+            )
+            """
         )
-    ''')
-    conn.commit()
-    conn.close()
 
-def process_item_and_check_restock(platform_id, platform, title, expiry_minutes=30):
+
+def is_empty() -> bool:
+    with _conn() as c:
+        return c.execute("SELECT COUNT(*) FROM inventory").fetchone()[0] == 0
+
+
+def check_item(key: str, platform: str, title: str, link: str) -> bool:
     """
-    Checks if an item is new or has returned from being out of stock.
-    Returns True if an alert should be sent.
+    Call for every item currently seen IN STOCK.
+    Returns True when an alert should be sent:
+      - brand new item (never seen before), or
+      - item previously marked 'out' that is now back.
     """
-    conn = sqlite3.connect("inventory.db")
-    cursor = conn.cursor()
-    
-    now = datetime.now()
-    cutoff_time = now - timedelta(minutes=expiry_minutes)
-    
-    cursor.execute("SELECT last_seen FROM active_inventory WHERE platform_id = ?", (platform_id,))
-    row = cursor.fetchone()
-    
-    is_alertable = False
-    
-    if row is None:
-        is_alertable = True
-    else:
-        last_seen_str = row[0]
-        try:
-            last_seen_time = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S.%f")
-        except ValueError:
-            try:
-                last_seen_time = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                last_seen_time = cutoff_time - timedelta(days=1)
-                
-        if last_seen_time < cutoff_time:
-            is_alertable = True
-            
-    cursor.execute('''
-        INSERT OR REPLACE INTO active_inventory (platform_id, platform, title, last_seen)
-        VALUES (?, ?, ?, ?)
-    ''', (platform_id, platform, title, now))
-    
-    conn.commit()
-    conn.close()
-    
-    return is_alertable
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    with _conn() as c:
+        row = c.execute("SELECT status FROM inventory WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            c.execute(
+                "INSERT INTO inventory (key, platform, title, link, status, miss_count, first_seen, last_seen) "
+                "VALUES (?, ?, ?, ?, 'in', 0, ?, ?)",
+                (key, platform, title, link, now, now),
+            )
+            return True
+
+        was_out = row[0] == "out"
+        c.execute(
+            "UPDATE inventory SET status='in', miss_count=0, title=?, link=?, last_seen=? WHERE key=?",
+            (title, link, now, key),
+        )
+        return was_out
+
+
+def mark_missing(platform: str, seen_keys: set) -> int:
+    """
+    Call once per platform AFTER a successful scan, with the keys seen in stock.
+    Items not seen get their miss_count bumped and flip to 'out' at the threshold.
+    """
+    flipped = 0
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT key, miss_count FROM inventory WHERE platform = ? AND status = 'in'",
+            (platform,),
+        ).fetchall()
+        for key, miss in rows:
+            if key in seen_keys:
+                continue
+            miss += 1
+            if miss >= MISS_THRESHOLD:
+                c.execute("UPDATE inventory SET status='out', miss_count=? WHERE key=?", (miss, key))
+                flipped += 1
+            else:
+                c.execute("UPDATE inventory SET miss_count=? WHERE key=?", (miss, key))
+    return flipped
