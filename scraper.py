@@ -13,7 +13,7 @@ from playwright.async_api import async_playwright
 # ---------------------------------------------------------------------------
 # Delivery location (Chennai) + pincode used for stock availability.
 LOCATION = {"latitude": 13.0827, "longitude": 80.2707}
-PINCODE = os.getenv("PINCODE") or "600126"  # set the PINCODE secret in GitHub for your area
+PINCODE = os.getenv("PINCODE") or "600001"  # set the PINCODE secret in GitHub for your area
 
 # Which platforms to scan. GitHub Actions' US IPs are blocked by BigBasket, Blinkit,
 # Instamart and Zepto (see debug output), so only FirstCry is on by default.
@@ -175,7 +175,9 @@ def _parse_card(raw: dict, cfg: dict):
     return {"platform": cfg["name"], "id": prod_id, "title": title, "price": price, "link": link, "image": img}
 
 
-async def _debug_dump(page, name: str):
+async def _debug_dump(page, name: str, force: bool = False):
+    if not force and os.getenv("DEBUG_DUMP") != "1":
+        return
     DEBUG_DIR.mkdir(exist_ok=True)
     try:
         await page.screenshot(path=str(DEBUG_DIR / f"{name}.png"), full_page=False)
@@ -198,7 +200,7 @@ async def _set_pincode(page, name: str) -> bool:
         except Exception:
             pass
         await page.wait_for_timeout(3000)
-        logging.info(f"[{name}] Pincode {PINCODE} submitted")
+        logging.info(f"[{name}] Pincode submitted")
         return True
     except Exception as e:
         logging.warning(f"[{name}] Could not set pincode: {e}")
@@ -256,7 +258,7 @@ async def _scrape_platform(browser, device: dict, cfg: dict):
             body = (await page.inner_text("body")).lower()
             if len(body) < 300 or any(m in body for m in BLOCK_MARKERS):
                 logging.warning(f"[{name}] {url} looks blocked/empty (len={len(body)})")
-                await _debug_dump(page, f"{name}_{idx}")
+                await _debug_dump(page, f"{name}_{idx}", force=True)
                 all_ok = False
                 continue
 
@@ -267,13 +269,14 @@ async def _scrape_platform(browser, device: dict, cfg: dict):
             items.extend(parsed)
 
             if not raw_cards and not any(m in body for m in NO_RESULT_MARKERS):
+                await _debug_dump(page, f"{name}_{idx}", force=True)
                 logging.warning(f"[{name}] page {idx}: 0 cards and no 'no results' message -> scan failed")
                 all_ok = False
 
         return name, items, all_ok
     except Exception as e:
         logging.error(f"[{name}] Error: {e}")
-        await _debug_dump(page, f"{name}_error")
+        await _debug_dump(page, f"{name}_error", force=True)
         return name, [], False
     finally:
         await ctx.close()
