@@ -1,80 +1,94 @@
 import os
 import asyncio
+import html
 import logging
+
 from telegram import Bot
 from telegram.constants import ParseMode
+
 from scraper import fetch_all_stores
-from db import init_db, process_item_and_check_restock
+from db import init_db, is_empty, check_item, mark_missing
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+
 async def send_stock_alert(bot: Bot, item: dict):
-    """Formats and sends a Telegram message with a direct buy link."""
-    title = item.get('title', 'Hot Wheels Product')
-    platform = item.get('platform', 'Store')
-    price = item.get('price', 'Check App')
-    link = item.get('link', 'https://google.com')
-    
+    title = html.escape(item.get("title", "Hot Wheels Product"))
+    platform = html.escape(item.get("platform", "Store"))
+    price = html.escape(item.get("price", "Check App"))
+    link = html.escape(item.get("link", "https://google.com"), quote=True)
+
     message = (
-        f"🔥 <b>HOT WHEELS STOCK / RESTOCK ALERT!</b> 🔥\n\n"
+        "🔥 <b>HOT WHEELS STOCK / RESTOCK ALERT!</b> 🔥\n\n"
         f"🏎️ <b>Product:</b> {title}\n"
         f"🏬 <b>Store:</b> {platform}\n"
         f"💰 <b>Price:</b> {price}\n\n"
         f"🔗 <a href='{link}'><b>Click here to Buy Now</b></a>"
     )
-    
-    try:
-        if item.get("image"):
+
+    if item.get("image"):
+        try:
             await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=item["image"],
-                caption=message,
-                parse_mode=ParseMode.HTML
+                chat_id=TELEGRAM_CHAT_ID, photo=item["image"],
+                caption=message, parse_mode=ParseMode.HTML,
             )
-        else:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=message,
-                parse_mode=ParseMode.HTML
-            )
+            return
+        except Exception as e:
+            logging.warning(f"Photo send failed, falling back to text: {e}")
+
+    try:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode=ParseMode.HTML)
     except Exception as e:
         logging.error(f"Failed to send Telegram message: {e}")
+
 
 async def monitor_stock():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     init_db()
+    first_run = is_empty()
     logging.info("Checking all platforms for Hot Wheels stock & new releases...")
 
-    try:
-        available_items = await fetch_all_stores()
-        
-        for item in available_items:
-            platform = item.get('platform', 'Store')
-            prod_id = item.get('id', '')
-            title = item.get('title', '')
-            
-            if not prod_id or not title:
-                continue
-                
-            unique_key = f"{platform}_{prod_id}"
-            
-            # Checks SQLite database with 30-min TTL logic to prevent duplicate alerts
-            if process_item_and_check_restock(unique_key, platform, title):
-                logging.info(f"Stock/Restock detected: {title} on {platform}")
-                await send_stock_alert(bot, item)
-                
-    except Exception as e:
-        logging.error(f"Error during execution cycle: {e}")
+    items, ok_platforms = await fetch_all_stores()
+    logging.info(f"Scanned OK: {sorted(ok_platforms) or 'none'} | in-stock items: {len(items)}")
+
+    seen = {p: set() for p in ok_platforms}
+    alerts = 0
+
+    for item in items:
+        platform, prod_id, title = item.get("platform"), item.get("id"), item.get("title")
+        if not platform or not prod_id or not title:
+            continue
+        key = f"{platform}_{prod_id}"
+        seen.setdefault(platform, set()).add(key)
+
+        should_alert = check_item(key, platform, title, item.get("link", ""))
+        if should_alert and not first_run:
+            logging.info(f"New/restock: {title} on {platform}")
+            await send_stock_alert(bot, item)
+            alerts += 1
+            await asyncio.sleep(1)  # stay under Telegram rate limits
+
+    # Only platforms that scanned successfully may mark items as out of stock
+    for platform in ok_platforms:
+        mark_missing(platform, seen.get(platform, set()))
+
+    if first_run:
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=f"✅ Hot Wheels bot is live. Tracking {len(items)} in-stock items right now. "
+                 f"You'll be alerted on new drops and restocks.",
+        )
+    logging.info(f"Done. Alerts sent: {alerts}")
+
 
 if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram credentials missing from environment variables!")
-    else:
-        try:
-            # Force script to timeout safely after 30 seconds if any store connection hangs
-            asyncio.run(asyncio.wait_for(monitor_stock(), timeout=30.0))
-        except asyncio.TimeoutError:
-            logging.error("❌ Execution timed out after 30 seconds and was safely aborted.")
+        raise SystemExit(1)
+    try:
+        asyncio.run(asyncio.wait_for(monitor_stock(), timeout=240.0))
+    except asyncio.TimeoutError:
+        logging.error("❌ Execution timed out after 240 seconds and was aborted.")
