@@ -15,7 +15,7 @@ concurrency:
 jobs:
   check-stock:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
