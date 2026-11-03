@@ -12,7 +12,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 async def send_stock_alert(bot: Bot, item: dict):
-    """Formats and sends a Telegram message with a buy link."""
+    """Formats and sends a Telegram message with a direct buy link."""
     title = item.get('title', 'Hot Wheels Product')
     platform = item.get('platform', 'Store')
     price = item.get('price', 'Check App')
@@ -46,7 +46,7 @@ async def send_stock_alert(bot: Bot, item: dict):
 async def monitor_stock():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     init_db()
-    logging.info("Checking all quick-commerce APIs for Hot Wheels...")
+    logging.info("Checking all platforms for Hot Wheels stock & new releases...")
 
     try:
         available_items = await fetch_all_stores()
@@ -61,6 +61,7 @@ async def monitor_stock():
                 
             unique_key = f"{platform}_{prod_id}"
             
+            # Checks SQLite database with 30-min TTL logic to prevent duplicate alerts
             if process_item_and_check_restock(unique_key, platform, title):
                 logging.info(f"Stock/Restock detected: {title} on {platform}")
                 await send_stock_alert(bot, item)
