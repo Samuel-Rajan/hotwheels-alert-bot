@@ -37,11 +37,18 @@ def init_db():
             )
             """
         )
+        c.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
 
 
-def is_empty() -> bool:
+def is_first_run() -> bool:
+    """True until the bot has successfully seen products at least once."""
     with _conn() as c:
-        return c.execute("SELECT COUNT(*) FROM inventory").fetchone()[0] == 0
+        return c.execute("SELECT 1 FROM meta WHERE k='seeded'").fetchone() is None
+
+
+def mark_seeded():
+    with _conn() as c:
+        c.execute("INSERT OR REPLACE INTO meta (k, v) VALUES ('seeded', '1')")
 
 
 def check_item(key: str, platform: str, title: str, link: str) -> bool:
