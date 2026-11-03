@@ -6,25 +6,23 @@ import json
 
 async def fetch_all_stores():
     """
-    Bulletproof scraper for FirstCry, BigBasket, Blinkit, Swiggy Instamart, and Zepto.
-    Handles HTML DOM cards, embedded Next.js state data, direct JSON APIs, and mobile app headers.
+    Bulletproof scraper covering FirstCry, BigBasket, Blinkit, Instamart, and Zepto.
+    Optimized to catch all mainline and premium Hot Wheels drops without url-filtering blocks.
     """
     all_in_stock = []
     
-    # Authenticity headers with Geolocation for Chennai, India quick-commerce servicing
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/json,*/*;q=0.8",
         "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8",
         "Cache-Control": "no-cache",
-        "x-location-context": "13.0827,80.2707", # Chennai Lat/Lng context
-        "x-city-id": "1",
+        "x-location-context": "13.0827,80.2707",
     }
 
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         
         # ==========================================
-        # 1. FIRSTCRY (Sort by Newness + Broad DOM Selector)
+        # 1. FIRSTCRY (Robust DOM & Link Capture)
         # ==========================================
         try:
             logging.info("[FirstCry] Querying search page (sorted by newness)...")
@@ -33,49 +31,31 @@ async def fetch_all_stores():
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, 'html.parser')
                 
-                # Check for embedded state JSON payload first
-                script_tag = soup.find("script", id="__NEXT_DATA__")
-                if script_tag and script_tag.string:
-                    try:
-                        js_data = json.loads(script_tag.string)
-                        prods = js_data.get("props", {}).get("pageProps", {}).get("products", [])
-                        for prod in prods:
-                            title = prod.get("prodName", "")
-                            if "hot wheels" in title.lower() and prod.get("isOutOfStock") is not True:
-                                prod_url = prod.get("prodUrl", "")
-                                link = prod_url if prod_url.startswith("http") else f"https://www.firstcry.com{prod_url}"
-                                all_in_stock.append({
-                                    "platform": "FirstCry",
-                                    "id": str(prod.get("prodId", prod_url)),
-                                    "title": title[:80],
-                                    "price": f"₹{prod.get('price', 'Check App')}",
-                                    "link": link
-                                })
-                    except Exception:
-                        pass
-                
-                # HTML DOM Fallback parsing (catches McLaren W1, Audi RS6, Lotus Cortina, etc.)
+                # Target all product cards and anchor tags carrying product info
                 cards = soup.select(".prod-item, .list-block, div[class*='product'], div[class*='item'], li[class*='product'], a[href]")
+                
                 for card in cards:
                     text = card.get_text(" ", strip=True)
                     text_lower = text.lower()
                     
+                    # Look for Hot Wheels items that are in stock
                     if "hot wheels" in text_lower and "out of stock" not in text_lower and "sold out" not in text_lower:
                         a_tag = card if card.name == 'a' else card.find('a', href=True)
                         if a_tag and a_tag.get('href'):
                             href = a_tag['href']
-                            if any(x in href for x in ["/search?", "/s?", "#", "javascript:"]):
+                            if href == "#" or href.startswith("javascript:"):
                                 continue
 
                             link = href if href.startswith("http") else f"https://www.firstcry.com{href}"
                             
-                            # Clean Unique ID extraction
-                            prod_id_match = re.search(r'/p/([a-zA-Z0-9\-_]+)', link) or re.search(r'/([0-9]{5,10})', link)
+                            # Extract a reliable unique product ID from the URL path or query params
+                            prod_id_match = re.search(r'/p/([a-zA-Z0-9\-_]+)', link) or re.search(r'pid=([a-zA-Z0-9\-_]+)', link) or re.search(r'/([0-9]{5,10})', link)
                             prod_id = prod_id_match.group(1) if prod_id_match else link.split('?')[0].split('/')[-1]
 
-                            if not prod_id or len(prod_id) < 3:
+                            if not prod_id or len(prod_id) < 2:
                                 continue
 
+                            # Extract Price
                             price = "Check App"
                             for word in text.split():
                                 if "₹" in word or "INR" in word:
@@ -210,7 +190,7 @@ async def fetch_all_stores():
         except Exception as e:
             logging.error(f"[Zepto] Error: {e}")
 
-    # Deduplicate items in the same run to prevent multiple alerts for the same item
+    # Deduplicate items in the current run
     unique_results = {}
     for item in all_in_stock:
         key = f"{item['platform']}_{item['id']}"
