@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '3-59/5 * * * *'     # every 5 min at :03, :08, :13... (off the congested :00/:05 marks)
   workflow_dispatch:
+    inputs:
+      test_count:
+        description: "Test mode: run the full alert + add-to-cart flow on the first N in-stock cars (0 = off)"
+        required: false
+        default: "0"
 
 permissions:
   contents: write              # commit inventory.db
@@ -16,7 +21,7 @@ concurrency:
 jobs:
   check-stock:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 14
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -51,6 +56,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PINCODE: ${{ secrets.PINCODE }}
+          FIRSTCRY_STATE_B64: ${{ secrets.FIRSTCRY_STATE_B64 }}
+          TEST_COUNT: ${{ github.event.inputs.test_count || '0' }}
         run: python main.py
 
       - name: Upload debug screenshots
