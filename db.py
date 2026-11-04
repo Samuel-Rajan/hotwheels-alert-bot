@@ -5,9 +5,11 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "inventory.db"
 
+# Bump when the meaning of keys changes. A bump wipes old rows and re-seeds silently.
+SCHEMA = "2"   # v2: FirstCry keys are real product IDs (v1 used title hashes)
+
 # An item must be missing from this many consecutive successful scans
-# before it is considered "out of stock". Protects against flaky scrapes
-# causing fake restock alerts.
+# before it counts as "out of stock" (protects against flaky scrapes).
 MISS_THRESHOLD = 2
 
 
@@ -38,6 +40,11 @@ def init_db():
             """
         )
         c.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+        row = c.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
+        if row is None or row[0] != SCHEMA:
+            c.execute("DELETE FROM inventory")
+            c.execute("DELETE FROM meta WHERE k='seeded'")
+            c.execute("INSERT OR REPLACE INTO meta (k, v) VALUES ('schema', ?)", (SCHEMA,))
 
 
 def is_first_run() -> bool:
@@ -53,9 +60,9 @@ def mark_seeded():
 
 def check_item(key: str, platform: str, title: str, link: str) -> bool:
     """
-    Call for every item currently seen IN STOCK.
-    Returns True when an alert should be sent:
-      - brand new item (never seen before), or
+    Call for every item currently seen IN STOCK on the listing.
+    Returns True when it is a candidate for an alert:
+      - brand new item, or
       - item previously marked 'out' that is now back.
     """
     now = datetime.utcnow().isoformat(timespec="seconds")
@@ -76,22 +83,17 @@ def check_item(key: str, platform: str, title: str, link: str) -> bool:
                 (title, link, now, key),
             )
         else:
-            # Still in stock: only touch the DB if a miss counter needs resetting.
-            # No write => inventory.db stays byte-identical => no commit noise.
+            # Still in stock: only write if a miss counter needs resetting (keeps the file unchanged).
             c.execute("UPDATE inventory SET miss_count=0 WHERE key=? AND miss_count<>0", (key,))
         return was_out
 
 
 def mark_missing(platform: str, seen_keys: set) -> int:
-    """
-    Call once per platform AFTER a successful scan, with the keys seen in stock.
-    Items not seen get their miss_count bumped and flip to 'out' at the threshold.
-    """
+    """After a successful scan of `platform`: items not seen flip to 'out' after MISS_THRESHOLD scans."""
     flipped = 0
     with _conn() as c:
         rows = c.execute(
-            "SELECT key, miss_count FROM inventory WHERE platform = ? AND status = 'in'",
-            (platform,),
+            "SELECT key, miss_count FROM inventory WHERE platform = ? AND status = 'in'", (platform,)
         ).fetchall()
         for key, miss in rows:
             if key in seen_keys:
@@ -103,3 +105,15 @@ def mark_missing(platform: str, seen_keys: set) -> int:
             else:
                 c.execute("UPDATE inventory SET miss_count=? WHERE key=?", (miss, key))
     return flipped
+
+
+def mark_out(key: str):
+    """Listing said in stock but the product page said out of stock: treat as out, alert on real restock."""
+    with _conn() as c:
+        c.execute("UPDATE inventory SET status='out', miss_count=? WHERE key=?", (MISS_THRESHOLD, key))
+
+
+def forget(key: str):
+    """Remove an item so the next run treats it as new again (used when an alert could not be sent)."""
+    with _conn() as c:
+        c.execute("DELETE FROM inventory WHERE key=?", (key,))
