@@ -8,16 +8,17 @@ from telegram import Bot
 from telegram.constants import ParseMode
 
 from scraper import fetch_all_stores, launch_browser
-from cart import Verifier, add_to_cart, CART_ATTEMPTS, SHORTLIST_ATTEMPTS
+from cart import Verifier, CartSession, CART_ATTEMPTS
 from db import (init_db, is_first_run, mark_seeded, check_item, mark_missing, mark_out, forget)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 MAX_VERIFY = 12          # candidates verified/alerted per run (extras are retried next run)
-MAX_CART_ITEMS = 4       # items per run that get the add-to-cart treatment
+MAX_CART_ITEMS = 3       # items per run that get the add-to-cart treatment
 RUN_BUDGET = 400         # seconds after which no new cart job is started
-CART_ITEM_BUDGET = 170   # seconds allowed per item for cart + shortlist retries
+CART_ITEM_BUDGET = 200   # seconds allowed per item for the wishlist -> cart retries
+HARD_STOP = 515          # never run cart work past this many seconds into the run
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -50,7 +51,7 @@ async def send_stock_alert(bot: Bot, item: dict, stock_status: str) -> bool:
         f"💰 <b>Price:</b> {price}\n"
         f"{check.get(stock_status, '')}\n\n"
         f"🔗 <a href='{link}'><b>Open this car &amp; buy now</b></a>\n"
-        "🛒 Trying to add it to your cart now…"
+        "🛒 Adding it to your cart via Wishlist now…"
     )
     if item.get("image"):
         try:
@@ -72,21 +73,19 @@ async def send_cart_result(bot: Bot, item: dict, res: dict):
     link = html.escape(item["link"], quote=True)
     st = res["status"]
     if st == "added":
-        head = f"🛒 <b>In your cart ✅</b> (cart attempt {res['cart_tries']}/{CART_ATTEMPTS})"
-    elif st == "added_shortlist":
-        head = (f"🛒 <b>In your cart ✅ via Shortlist</b> (cart tries {res['cart_tries']}, "
-                f"shortlist try {res['shortlist_tries']}/{SHORTLIST_ATTEMPTS})")
+        head = f"🛒 <b>In your cart ✅</b> via Wishlist (attempt {res['tries']}/{CART_ATTEMPTS})"
     elif st == "sold_out":
         head = "⚠️ <b>Sold out before I could add it</b>"
     else:
-        head = (f"❌ <b>Could not confirm it in the cart</b> after {res['cart_tries']} cart and "
-                f"{res['shortlist_tries']} shortlist attempts. Open the link and add it manually.")
+        head = (f"❌ <b>Could not confirm it in the cart</b> after {res['tries']} wishlist → cart attempts. "
+                f"Open the link and add it manually.")
     lines = [head, f"🏎️ {title}", f"🔗 <a href='{link}'>Open product</a>"]
-    if st in ("added", "added_shortlist") and res.get("logged_in") is not True:
+    if st == "added" and res.get("logged_in") is not True:
         lines.append("ℹ️ This used a guest session, so it is <b>not</b> in your own FirstCry account cart. "
                      "Set the FIRSTCRY_STATE_B64 secret (see login_helper.py) to fill your real cart.")
-    if st == "failed" and res.get("logged_in") is False:
-        lines.append("ℹ️ Guest session: shortlist needs a logged-in session. Set FIRSTCRY_STATE_B64.")
+    if st == "failed" and res.get("logged_in") is not True:
+        lines.append("ℹ️ Guest/unknown session: Wishlist needs a logged-in session. Set FIRSTCRY_STATE_B64 "
+                     "(it may also have expired; re-run login_helper.py).")
     if st == "failed" and res.get("detail"):
         lines.append(f"Reason: {html.escape(res['detail'])}")
     await send_text(bot, "\n".join(lines))
@@ -156,13 +155,20 @@ async def monitor_stock():
 
         # ---------------- Phase 2: add to cart (after all alerts are out)
         fc_items = [i for i in confirmed if i["platform"] == "FirstCry"]
-        for item in fc_items[:MAX_CART_ITEMS]:
-            if time.monotonic() - t0 > RUN_BUDGET:
-                await send_text(bot, f"⏱️ Skipped cart attempt (run time budget): {html.escape(item['title'][:70])}")
-                continue
-            res = await add_to_cart(browser, item, deadline=time.monotonic() + CART_ITEM_BUDGET)
-            logging.info(f"Cart result for {item['id']}: {res}")
-            await send_cart_result(bot, item, res)
+        if fc_items:
+            session = await CartSession.create(browser)
+            try:
+                for item in fc_items[:MAX_CART_ITEMS]:
+                    if time.monotonic() - t0 > RUN_BUDGET:
+                        await send_text(bot, f"⏱️ Skipped cart attempt (run time budget): "
+                                             f"{html.escape(item['title'][:70])}")
+                        continue
+                    deadline = min(time.monotonic() + CART_ITEM_BUDGET, t0 + HARD_STOP)
+                    res = await session.add(item, deadline)
+                    logging.info(f"Cart result for {item['id']}: {res}")
+                    await send_cart_result(bot, item, res)
+            finally:
+                await session.close()
         if len(fc_items) > MAX_CART_ITEMS:
             await send_text(bot, f"ℹ️ {len(fc_items) - MAX_CART_ITEMS} more car(s) alerted without a cart attempt "
                                  f"(limit {MAX_CART_ITEMS} per run).")
