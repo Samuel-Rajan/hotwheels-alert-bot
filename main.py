@@ -83,8 +83,8 @@ async def send_cart_result(bot: Bot, item: dict, res: dict):
     if st == "added" and res.get("logged_in") is not True:
         lines.append("ℹ️ This used a guest session, so it is <b>not</b> in your own FirstCry account cart. "
                      "Set the FIRSTCRY_STATE_B64 secret (see login_helper.py) to fill your real cart.")
-    if st == "failed" and res.get("logged_in") is not True:
-        lines.append("ℹ️ Guest/unknown session: Wishlist needs a logged-in session. Set FIRSTCRY_STATE_B64 "
+    if st == "failed" and res.get("logged_in") is not True and "logged-in" in (res.get("detail") or ""):
+        lines.append("ℹ️ Wishlist needs a logged-in session. Set FIRSTCRY_STATE_B64 "
                      "(it may also have expired; re-run login_helper.py).")
     if st == "failed" and res.get("detail"):
         lines.append(f"Reason: {html.escape(res['detail'])}")
