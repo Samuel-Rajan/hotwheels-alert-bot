@@ -24,11 +24,15 @@ from playwright.async_api import async_playwright
 
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        try:
+            browser = await p.chromium.launch(headless=False, channel="chrome")   # your installed Chrome
+        except Exception:
+            browser = await p.chromium.launch(headless=False)
         ctx = await browser.new_context(viewport={"width": 1280, "height": 900}, locale="en-IN")
         page = await ctx.new_page()
         await page.goto("https://www.firstcry.com/")
-        print("\n1) In the browser window, click Login / Register and sign in with your OTP.")
+        print("\n1) In the browser window, click Login / Register and sign in (mobile OTP, or Google).")
+        print("   If Google says the browser is not secure, use the mobile-number OTP option instead.")
         print("2) Check that you can see 'My Account'.")
         input("3) Press Enter here when you are logged in... ")
         state = await ctx.storage_state()
