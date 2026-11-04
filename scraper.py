@@ -111,10 +111,10 @@ FC_EXTRACT_JS = r"""
     const pid = pidOf(a);
     if (seen.has(pid)) continue;
     seen.add(pid);
-    let card = a;
-    while (card.parentElement && card.parentElement !== document.body &&
+    let card = a, depth = 0;
+    while (card.parentElement && card.parentElement !== document.body && depth++ < 15 &&
            countPids(card.parentElement) <= 1 &&
-           (card.parentElement.innerText || "").length < 1500) {
+           (card.parentElement.innerText || "").length < 9000) {
       card = card.parentElement;
     }
     const img = a.querySelector("img");
