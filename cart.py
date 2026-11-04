@@ -125,20 +125,66 @@ _CARD_SHORTLIST_JS = r"""
     el.querySelectorAll("a[href*='/product-detail']").forEach(x => { if (x.querySelector("img")) s.add(pidOf(x)); });
     return s.size;
   };
-  let card = mine;
-  while (card.parentElement && card.parentElement !== document.body &&
-         countPids(card.parentElement) <= 1 && (card.parentElement.innerText || "").length < 1500) {
+  let card = mine, depth = 0;
+  while (card.parentElement && card.parentElement !== document.body && depth++ < 15 &&
+         countPids(card.parentElement) <= 1 && (card.parentElement.innerText || "").length < 9000) {
     card = card.parentElement;
   }
   const txt = (card.innerText || "").toLowerCase();
   if (/notify me|out of stock|sold out/.test(txt) && !/add to cart/.test(txt)) return "oos";
-  const btn = [...card.querySelectorAll("button, a, div, span, i")]
-    .find(x => /^\s*shortlist\s*$/i.test(((x.innerText || x.getAttribute("title") || x.getAttribute("aria-label") || "")).trim()));
+  const els = [...card.querySelectorAll("button, a, div, span, i, svg, img, label")];
+  const labelOf = x => ((x.innerText || x.getAttribute("title") || x.getAttribute("aria-label") || x.getAttribute("alt") || "")).trim();
+  // 1) exact text "Shortlist"; 2) attribute/class/id says shortlist/wishlist (heart icon buttons)
+  let btn = els.find(x => /^\s*shortlist\s*$/i.test(labelOf(x)) && !/shortlisted/i.test(labelOf(x)));
+  if (!btn) btn = els.find(x => /short.?list|wish.?list/i.test((x.className && x.className.baseVal !== undefined ? x.className.baseVal : x.className) + " " + (x.id || ""))
+                              && labelOf(x).length < 25 && !/shortlisted/i.test(labelOf(x)));
   if (!btn) return "no-button";
   btn.scrollIntoView({block: "center"});
   btn.setAttribute("data-hw-sl", "1");
   return "ok";
 }
+"""
+
+# Same control, but on a product page (used when a car has no card of its own on the listing).
+_PAGE_SHORTLIST_JS = r"""
+() => {
+  document.querySelectorAll("[data-hw-sl]").forEach(x => x.removeAttribute("data-hw-sl"));
+  const els = [...document.querySelectorAll("button, a, div, span, i, label")];
+  const labelOf = x => ((x.innerText || x.getAttribute("title") || x.getAttribute("aria-label") || "")).trim();
+  let btn = els.find(x => /^\s*(add to )?(shortlist|wishlist)\s*$/i.test(labelOf(x)));
+  if (!btn) btn = els.find(x => /short.?list|wish.?list/i.test((x.className || "") + " " + (x.id || "")) && labelOf(x).length < 25
+                              && !/shortlisted/i.test(labelOf(x)));
+  if (!btn) return "no-button";
+  btn.scrollIntoView({block: "center"});
+  btn.setAttribute("data-hw-sl", "1");
+  return "ok";
+}
+"""
+
+# Returns the card's HTML so a failed run leaves evidence of FirstCry's real markup.
+_CARD_HTML_JS = r"""
+(pid) => {
+  const PID = /\/(\d+)\/product-detail/;
+  const pidOf = a => { const m = PID.exec(a.getAttribute("href") || ""); return m ? m[1] : null; };
+  const imgLinks = [...document.querySelectorAll("a[href*='/product-detail']")].filter(a => a.querySelector("img"));
+  const mine = imgLinks.find(a => pidOf(a) === pid);
+  if (!mine) return "";
+  const countPids = el => {
+    const s = new Set();
+    el.querySelectorAll("a[href*='/product-detail']").forEach(x => { if (x.querySelector("img")) s.add(pidOf(x)); });
+    return s.size;
+  };
+  let card = mine, depth = 0;
+  while (card.parentElement && card.parentElement !== document.body && depth++ < 15 &&
+         countPids(card.parentElement) <= 1 && (card.parentElement.innerText || "").length < 9000) {
+    card = card.parentElement;
+  }
+  return card.outerHTML.slice(0, 12000);
+}
+"""
+
+_HAS_CARD_JS = r"""
+(pid) => [...document.querySelectorAll("a[href*='/" + pid + "/product-detail']")].some(a => a.querySelector("img"))
 """
 
 # On the My Shortlist page: finds the 'Add to cart' control belonging to product `pid` (ticks its checkbox).
@@ -235,7 +281,6 @@ class CartSession:
     async def _find_card(self, item: dict, deadline: float) -> str:
         """Make sure the car's card is on the listing page (loading more products as needed)."""
         pid = item["id"]
-        sel = f"a[href*='/{pid}/product-detail']"
         for url in ([self._listing_url] if self._listing_url else []) + LISTING_URLS:
             if url != self._listing_url:
                 await self.listing.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -247,7 +292,7 @@ class CartSession:
             for _ in range(60):
                 if time.monotonic() > deadline:
                     return "timeout"
-                if await self.listing.locator(sel).count():
+                if await self.listing.evaluate(_HAS_CARD_JS, pid):
                     return "found"
                 cnt = await self.listing.evaluate(scraper.FC_COUNT_JS)
                 stable = stable + 1 if cnt == last else 0
@@ -267,9 +312,20 @@ class CartSession:
             self._listing_url = None            # not on this page; try the next listing URL
         return "not-found"
 
+    async def _dump_card(self, item: dict, mode: str):
+        try:
+            scraper.DEBUG_DIR.mkdir(exist_ok=True)
+            if mode == "card":
+                html_ = await self.listing.evaluate(_CARD_HTML_JS, item["id"])
+                (scraper.DEBUG_DIR / f"card_{item['id']}.html").write_text(html_ or "(card not found)", encoding="utf-8")
+            await debug_dump(self.listing, f"listing_{item['id']}", force=True)
+        except Exception as e:
+            logging.warning(f"[cart] card dump failed: {e}")
+
     async def add(self, item: dict, deadline: float) -> dict:
         """
         Listing card -> Shortlist -> My Shortlist -> Add to cart -> verify in cart.
+        (Cars that have no card of their own on the listing use their product page's Shortlist button.)
         Returns {status: added|sold_out|failed, tries, logged_in, detail}
         """
         res = {"status": "failed", "tries": 0, "logged_in": self.logged_in, "detail": ""}
@@ -277,8 +333,15 @@ class CartSession:
         try:
             where = await self._find_card(item, deadline)
             res["logged_in"] = self.logged_in
-            if where != "found":
-                res["detail"] = f"car not found on the listing page ({where})"
+            mode = "card"
+            if where == "not-found":
+                mode = "product"
+                self._listing_url = None
+                await self.listing.goto(item["link"], wait_until="domcontentloaded", timeout=30000)
+                await _settle(self.listing, 600)
+                logging.info(f"[cart] {pid}: no listing card, using the product page's Shortlist button")
+            elif where != "found":
+                res["detail"] = f"could not load the listing ({where})"
                 return res
 
             for attempt in range(1, CART_ATTEMPTS + 1):
@@ -287,16 +350,21 @@ class CartSession:
                     break
                 res["tries"] = attempt
 
-                # 1) Shortlist it from the listing card -- but only if it is not shortlisted yet
+                # 1) Shortlist it -- but only if it is not shortlisted yet
                 #    (clicking Shortlist on an already-shortlisted car would remove it).
                 already = await _shortlist_has(self.shortlist, item)
                 if not already:
-                    r = await self.listing.evaluate(_CARD_SHORTLIST_JS, pid)
+                    if mode == "card":
+                        r = await self.listing.evaluate(_CARD_SHORTLIST_JS, pid)
+                    else:
+                        r = await self.listing.evaluate(_PAGE_SHORTLIST_JS)
                     if r == "oos":
                         res["status"], res["detail"] = "sold_out", "listing card shows out of stock"
                         return res
                     if r != "ok":
-                        res["detail"] = f"shortlist control: {r}"
+                        res["detail"] = f"shortlist control: {r} ({mode})"
+                        if attempt == 1:
+                            await self._dump_card(item, mode)
                         continue
                     if not await _click_tagged(self.listing, "[data-hw-sl='1']"):
                         res["detail"] = "could not click Shortlist"
@@ -305,12 +373,16 @@ class CartSession:
                     if not await _shortlist_has(self.shortlist, item):
                         res["detail"] = ("clicked Shortlist but the car is not on My Shortlist "
                                          "(shortlisting needs a logged-in session)")
+                        if attempt == 1:
+                            await self._dump_card(item, mode)
                         continue
 
                 # 2) Add it to the cart from the shortlist page
                 r = await self.shortlist.evaluate(_SHORTLIST_ADD_JS, pid)
                 if r != "ok":
                     res["detail"] = f"shortlist page: {r}"
+                    if attempt == 1:
+                        await debug_dump(self.shortlist, f"shortlist_{pid}", force=True)
                     continue
                 if not await _click_tagged(self.shortlist, "[data-hw-target='1']"):
                     res["detail"] = "could not click Add to cart on the shortlist page"
