@@ -84,25 +84,31 @@ async def send_cart_result(bot: Bot, item: dict, res: dict):
     if st == "added" and res.get("logged_in") is not True:
         lines.append("ℹ️ This used a guest session, so it is <b>not</b> in your own FirstCry account cart. "
                      "Set the FIRSTCRY_STATE_B64 secret (see login_helper.py) to fill your real cart.")
-    if st == "failed" and res.get("logged_in") is not True and "logged-in" in (res.get("detail") or ""):
-        lines.append("ℹ️ Wishlist needs a logged-in session. Set FIRSTCRY_STATE_B64 "
-                     "(it may also have expired; re-run login_helper.py).")
+    if st == "failed" and res.get("logged_in") is False and "log in" not in (res.get("detail") or ""):
+        lines.append("ℹ️ This ran as a guest, so Wishlist and cart can't be tied to your account. "
+                     "Set FIRSTCRY_STATE_B64 (see login_helper.py).")
     if st == "failed" and res.get("detail"):
         lines.append(f"Reason: {html.escape(res['detail'])}")
     await send_text(bot, "\n".join(lines))
 
 
 async def send_evidence(bot: Bot, item: dict, res: dict):
-    """On a cart failure, send FirstCry's real card markup so the selectors can be fixed from facts."""
+    """On a cart failure, send what FirstCry's pages really looked like so the code can be fixed from facts."""
     ev = res.get("evidence") or {}
+    pid = item["id"]
+    files = [
+        ("probe", f"probe_{pid}.json", "🔧 Debug: what is inside this car's card"),
+        ("card_html", f"card_{pid}.html", None),
+        ("shortlist_probe", f"shortlist_probe_{pid}.json", "🔧 Debug: state after clicking Shortlist + My Shortlist page"),
+    ]
     try:
-        if ev.get("probe"):
-            await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=io.BytesIO(ev["probe"].encode("utf-8")),
-                                    filename=f"probe_{item['id']}.json",
-                                    caption="🔧 Debug: what is inside this car's card. Send this file and the next one to Claude.")
-        if ev.get("card_html"):
-            await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=io.BytesIO(ev["card_html"].encode("utf-8")),
-                                    filename=f"card_{item['id']}.html")
+        for key, name, caption in files:
+            if ev.get(key):
+                await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=io.BytesIO(ev[key].encode("utf-8")),
+                                        filename=name, caption=caption)
+        for key, name in (("listing_png", f"listing_{pid}.png"), ("shortlist_png", f"my_shortlist_{pid}.png")):
+            if ev.get(key):
+                await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=io.BytesIO(ev[key]), filename=name)
     except Exception as e:
         logging.warning(f"Could not send debug files: {e}")
 
