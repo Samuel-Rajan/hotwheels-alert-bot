@@ -234,6 +234,56 @@ _SEGMENT_PROBE_JS = r"""
 }
 """
 
+_CARD_STATE_JS = r"""
+(pid) => {
+  // popup: a visible overlay that looks like a login / OTP prompt
+  let popup = "";
+  for (const e of document.querySelectorAll("body *")) {
+    const cs = getComputedStyle(e);
+    if (cs.position !== "fixed" && cs.position !== "absolute") continue;
+    if ((parseInt(cs.zIndex || "0", 10) || 0) < 50) continue;
+    const r = e.getBoundingClientRect();
+    if (r.width < 150 || r.height < 80 || cs.display === "none" || cs.visibility === "hidden") continue;
+    const t = (e.innerText || "").trim();
+    if (/log\s*in|sign\s*in|register|otp|mobile\s*(no|number)/i.test(t)) { popup = t.slice(0, 220); break; }
+  }
+  // badge: does this car's card now show the "Shortlisted" state?
+  const PID = /\/(\d+)\/product-detail/;
+  const links = [...document.querySelectorAll("a[href*='/product-detail']")].filter(a => a.querySelector("img"));
+  const pids = links.map(a => (PID.exec(a.getAttribute("href") || "") || [])[1]);
+  const i = pids.indexOf(pid);
+  let badge = null;
+  if (i >= 0) {
+    const mine = links[i];
+    let next = null;
+    for (let j = i + 1; j < links.length; j++) { if (pids[j] !== pid) { next = links[j]; break; } }
+    const FOLLOW = Node.DOCUMENT_POSITION_FOLLOWING, PREC = Node.DOCUMENT_POSITION_PRECEDING;
+    badge = false;
+    for (const el of document.querySelectorAll("body *")) {
+      if (/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(el.tagName)) continue;
+      if (!(mine.compareDocumentPosition(el) & FOLLOW)) continue;
+      if (next && (!(next.compareDocumentPosition(el) & PREC) || el.contains(next))) continue;
+      const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.nodeValue.trim()).join(" ");
+      if (/^shortlisted$/i.test(own)) {
+        const r = el.getBoundingClientRect(); const cs = getComputedStyle(el);
+        if (r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none") { badge = true; break; }
+      }
+    }
+  }
+  return {popup, badge};
+}
+"""
+
+_SHORTLIST_PROBE_JS = r"""
+() => ({
+  url: location.href,
+  title: document.title,
+  text: (document.body.innerText || "").slice(0, 2500),
+  product_links: [...document.querySelectorAll("a[href]")].map(a => a.getAttribute("href"))
+                  .filter(h => /product-detail/.test(h || "")).slice(0, 40),
+})
+"""
+
 _HAS_CARD_JS = r"""
 (pid) => [...document.querySelectorAll("a[href*='/" + pid + "/product-detail']")].some(a => a.querySelector("img"))
 """
@@ -391,11 +441,24 @@ class CartSession:
             logging.warning(f"[cart] card dump failed: {e}")
         return evidence
 
+    async def _shortlist_evidence(self, item: dict, state: dict) -> dict:
+        """Facts about WHY the car did not appear on My Shortlist (sent to Telegram)."""
+        ev = {}
+        try:
+            probe = await self.shortlist.evaluate(_SHORTLIST_PROBE_JS)
+            ev["shortlist_probe"] = json.dumps({"card_state_after_click": state, "shortlist_page": probe},
+                                               indent=1, ensure_ascii=False)
+            ev["listing_png"] = await self.listing.screenshot()
+            ev["shortlist_png"] = await self.shortlist.screenshot()
+        except Exception as e:
+            logging.warning(f"[cart] shortlist evidence failed: {e}")
+        return ev
+
     async def add(self, item: dict, deadline: float) -> dict:
         """
         Listing card -> Shortlist -> My Shortlist -> Add to cart -> verify in cart.
         (Cars that have no card of their own on the listing use their product page's Shortlist button.)
-        Returns {status: added|sold_out|failed, tries, logged_in, detail}
+        Returns {status: added|sold_out|failed, tries, logged_in, detail, evidence?}
         """
         res = {"status": "failed", "tries": 0, "logged_in": self.logged_in, "detail": ""}
         pid = item["id"]
@@ -419,39 +482,62 @@ class CartSession:
                     break
                 res["tries"] = attempt
 
-                # 1) Shortlist it -- but only if it is not shortlisted yet
-                #    (clicking Shortlist on an already-shortlisted car would remove it).
-                already = await _shortlist_has(self.shortlist, item)
-                if not already:
-                    if mode == "card":
-                        r = await self.listing.evaluate(_CARD_SHORTLIST_JS, pid)
-                        if r == "no-button":
-                            # some sites only inject the control on hover
-                            try:
-                                await self.listing.locator(f"a[href*='/{pid}/product-detail']:has(img)").first.hover(timeout=3000)
-                                await self.listing.wait_for_timeout(500)
-                                r = await self.listing.evaluate(_CARD_SHORTLIST_JS, pid)
-                            except Exception:
-                                pass
+                # 1) Make sure the car is on My Shortlist. Clicking Shortlist on a car that is already
+                #    shortlisted would REMOVE it, so check the page and the card's own state first.
+                if not await _shortlist_has(self.shortlist, item):
+                    state = await self.listing.evaluate(_CARD_STATE_JS, pid) if mode == "card" else {"popup": "", "badge": None}
+                    if state.get("popup"):                       # leftover popup from an earlier click
+                        await self.listing.keyboard.press("Escape")
+                        await self.listing.wait_for_timeout(300)
+                        if mode == "card":
+                            state = await self.listing.evaluate(_CARD_STATE_JS, pid)
+                    before_popup = state.get("popup", "")
+                    if not state.get("badge"):
+                        if mode == "card":
+                            r = await self.listing.evaluate(_CARD_SHORTLIST_JS, pid)
+                            if r == "no-button":
+                                try:      # some sites only inject the control on hover
+                                    await self.listing.locator(f"a[href*='/{pid}/product-detail']:has(img)").first.hover(timeout=3000)
+                                    await self.listing.wait_for_timeout(500)
+                                    r = await self.listing.evaluate(_CARD_SHORTLIST_JS, pid)
+                                except Exception:
+                                    pass
+                        else:
+                            r = await self.listing.evaluate(_PAGE_SHORTLIST_JS)
+                        if r == "oos":
+                            res["status"], res["detail"] = "sold_out", "listing card shows out of stock"
+                            return res
+                        if not str(r).startswith("ok"):
+                            res["detail"] = f"shortlist control: {r} ({mode})"
+                            if attempt == 1:
+                                res["evidence"] = await self._dump_card(item, mode)
+                            continue
+                        logging.info(f"[cart] {pid}: Shortlist control found via {r}")
+                        if not await _click_tagged(self.listing, "[data-hw-sl='1']"):
+                            res["detail"] = "could not click Shortlist"
+                            continue
+                        await self.listing.wait_for_timeout(1500)
                     else:
-                        r = await self.listing.evaluate(_PAGE_SHORTLIST_JS)
-                    if r == "oos":
-                        res["status"], res["detail"] = "sold_out", "listing card shows out of stock"
+                        logging.info(f"[cart] {pid}: card already shows Shortlisted; re-checking My Shortlist")
+                        await self.listing.wait_for_timeout(1500)
+
+                    state = await self.listing.evaluate(_CARD_STATE_JS, pid) if mode == "card" else {"popup": await self.listing.evaluate(
+                        "() => (document.body.innerText.match(/log\\s*in|sign\\s*in|otp/i) ? 'login text on page' : '')"), "badge": None}
+                    if state.get("popup") and not before_popup:      # a NEW login prompt appeared after the click
+                        res["logged_in"] = False
+                        res["detail"] = ("FirstCry asked to log in after clicking Shortlist: the saved session was rejected "
+                                         "or expired (logged-in session needed). Re-run login_helper.py and update FIRSTCRY_STATE_B64.")
+                        res["evidence"] = await self._shortlist_evidence(item, state)
                         return res
-                    if not str(r).startswith("ok"):
-                        res["detail"] = f"shortlist control: {r} ({mode})"
-                        if attempt == 1:
-                            res["evidence"] = await self._dump_card(item, mode)
-                        continue
-                    logging.info(f"[cart] {pid}: Shortlist control found via {r}")
-                    if not await _click_tagged(self.listing, "[data-hw-sl='1']"):
-                        res["detail"] = "could not click Shortlist"
-                        continue
-                    await self.listing.wait_for_timeout(1200)
                     if not await _shortlist_has(self.shortlist, item):
-                        res["detail"] = ("clicked Shortlist but the car is not on My Shortlist "
-                                         "(shortlisting needs a logged-in session)")
-                        continue
+                        await self.shortlist.wait_for_timeout(2500)
+                        if not await _shortlist_has(self.shortlist, item):
+                            res["detail"] = (f"clicked Shortlist (card shows Shortlisted: {state.get('badge')}) but the car "
+                                             f"is not on My Shortlist")
+                            if attempt == 1:
+                                ev = await self._shortlist_evidence(item, state)
+                                res["evidence"] = {**res.get("evidence", {}), **ev}
+                            continue
 
                 # 2) Add it to the cart from the shortlist page
                 r = await self.shortlist.evaluate(_SHORTLIST_ADD_JS, pid)
