@@ -116,31 +116,28 @@ _CARD_SHORTLIST_JS = r"""
 (pid) => {
   document.querySelectorAll("[data-hw-sl]").forEach(x => x.removeAttribute("data-hw-sl"));
   const PID = /\/(\d+)\/product-detail/;
-  const pidOf = a => { const m = PID.exec(a.getAttribute("href") || ""); return m ? m[1] : null; };
-  const imgLinks = [...document.querySelectorAll("a[href*='/product-detail']")].filter(a => a.querySelector("img"));
-  const mine = imgLinks.find(a => pidOf(a) === pid);
-  if (!mine) return "no-card";
-  const countPids = el => {
-    const s = new Set();
-    el.querySelectorAll("a[href*='/product-detail']").forEach(x => { if (x.querySelector("img")) s.add(pidOf(x)); });
-    return s.size;
-  };
-  let card = mine, depth = 0;
-  while (card.parentElement && card.parentElement !== document.body && depth++ < 15 &&
-         countPids(card.parentElement) <= 1 && (card.parentElement.innerText || "").length < 9000) {
-    card = card.parentElement;
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+  let cur = null, seenCard = false, found = null, addSeen = false, oosSeen = false, n;
+  while ((n = walker.nextNode())) {
+    if (n.nodeType === 1) {
+      if (n.tagName === "A" && n.querySelector("img")) {
+        const m = PID.exec(n.getAttribute("href") || "");
+        if (m) { cur = m[1]; if (cur === pid) seenCard = true; }
+      }
+      continue;
+    }
+    if (cur !== pid) continue;
+    const t = (n.nodeValue || "").trim();
+    if (!t) continue;
+    if (!found && /^shortlist$/i.test(t)) found = n.parentElement;
+    if (/^add to cart$/i.test(t)) addSeen = true;
+    if (/notify me|out of stock|sold out/i.test(t)) oosSeen = true;
   }
-  const txt = (card.innerText || "").toLowerCase();
-  if (/notify me|out of stock|sold out/.test(txt) && !/add to cart/.test(txt)) return "oos";
-  const els = [...card.querySelectorAll("button, a, div, span, i, svg, img, label")];
-  const labelOf = x => ((x.innerText || x.getAttribute("title") || x.getAttribute("aria-label") || x.getAttribute("alt") || "")).trim();
-  // 1) exact text "Shortlist"; 2) attribute/class/id says shortlist/wishlist (heart icon buttons)
-  let btn = els.find(x => /^\s*shortlist\s*$/i.test(labelOf(x)) && !/shortlisted/i.test(labelOf(x)));
-  if (!btn) btn = els.find(x => /short.?list|wish.?list/i.test((x.className && x.className.baseVal !== undefined ? x.className.baseVal : x.className) + " " + (x.id || ""))
-                              && labelOf(x).length < 25 && !/shortlisted/i.test(labelOf(x)));
-  if (!btn) return "no-button";
-  btn.scrollIntoView({block: "center"});
-  btn.setAttribute("data-hw-sl", "1");
+  if (!seenCard) return "no-card";
+  if (oosSeen && !addSeen) return "oos";
+  if (!found) return "no-button";
+  found.scrollIntoView({block: "center"});
+  found.setAttribute("data-hw-sl", "1");
   return "ok";
 }
 """
@@ -149,14 +146,18 @@ _CARD_SHORTLIST_JS = r"""
 _PAGE_SHORTLIST_JS = r"""
 () => {
   document.querySelectorAll("[data-hw-sl]").forEach(x => x.removeAttribute("data-hw-sl"));
-  const els = [...document.querySelectorAll("button, a, div, span, i, label")];
-  const labelOf = x => ((x.innerText || x.getAttribute("title") || x.getAttribute("aria-label") || "")).trim();
-  let btn = els.find(x => /^\s*(add to )?(shortlist|wishlist)\s*$/i.test(labelOf(x)));
-  if (!btn) btn = els.find(x => /short.?list|wish.?list/i.test((x.className || "") + " " + (x.id || "")) && labelOf(x).length < 25
-                              && !/shortlisted/i.test(labelOf(x)));
-  if (!btn) return "no-button";
-  btn.scrollIntoView({block: "center"});
-  btn.setAttribute("data-hw-sl", "1");
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let n, found = null;
+  while ((n = walker.nextNode())) {
+    const t = (n.nodeValue || "").trim();
+    const p = n.parentElement;
+    if (!p || !/^(add to )?(shortlist|wishlist)$/i.test(t)) continue;
+    if (p.closest("a[href*='myshortlist']")) continue;          // skip the header "Shortlist" link
+    if (!found || (p.offsetParent !== null && found.offsetParent === null)) found = p;
+  }
+  if (!found) return "no-button";
+  found.scrollIntoView({block: "center"});
+  found.setAttribute("data-hw-sl", "1");
   return "ok";
 }
 """
@@ -165,21 +166,19 @@ _PAGE_SHORTLIST_JS = r"""
 _CARD_HTML_JS = r"""
 (pid) => {
   const PID = /\/(\d+)\/product-detail/;
-  const pidOf = a => { const m = PID.exec(a.getAttribute("href") || ""); return m ? m[1] : null; };
   const imgLinks = [...document.querySelectorAll("a[href*='/product-detail']")].filter(a => a.querySelector("img"));
-  const mine = imgLinks.find(a => pidOf(a) === pid);
+  const mine = imgLinks.find(a => (PID.exec(a.getAttribute("href") || "") || [])[1] === pid);
   if (!mine) return "";
-  const countPids = el => {
-    const s = new Set();
-    el.querySelectorAll("a[href*='/product-detail']").forEach(x => { if (x.querySelector("img")) s.add(pidOf(x)); });
-    return s.size;
-  };
   let card = mine, depth = 0;
-  while (card.parentElement && card.parentElement !== document.body && depth++ < 15 &&
-         countPids(card.parentElement) <= 1 && (card.parentElement.innerText || "").length < 9000) {
-    card = card.parentElement;
+  while (card.parentElement && card.parentElement !== document.body && depth++ < 6) card = card.parentElement;
+  const idx = imgLinks.indexOf(mine);
+  let el = mine, out = "";
+  for (let i = 0; i < 8 && el.parentElement; i++, el = el.parentElement) {
+    const next = imgLinks[idx + 1];
+    if (next && el.contains(next)) break;
+    out = el.outerHTML;
   }
-  return card.outerHTML.slice(0, 12000);
+  return (out || card.outerHTML).slice(0, 14000);
 }
 """
 
@@ -191,17 +190,27 @@ _HAS_CARD_JS = r"""
 _SHORTLIST_ADD_JS = r"""
 (pid) => {
   document.querySelectorAll("[data-hw-target]").forEach(x => x.removeAttribute("data-hw-target"));
-  const a = [...document.querySelectorAll("a[href]")].find(x => (x.getAttribute("href") || "").includes("/" + pid + "/"));
-  if (!a) return "not-listed";
-  let el = a;
-  for (let i = 0; i < 8 && el; i++, el = el.parentElement) {
-    const b = [...el.querySelectorAll("button, a, div, span, input")]
-      .find(x => /^\s*(add to cart|move to cart)\s*$/i.test((x.innerText || x.value || "").trim()) && x.offsetParent !== null);
-    if (b) {
-      const cb = el.querySelector("input[type=checkbox]");
-      if (cb && !cb.checked) cb.click();
-      b.setAttribute("data-hw-target", "1");
-      return "ok";
+  const PID = /\/(\d+)\/product-detail/;
+  const pidOf = a => { const m = PID.exec(a.getAttribute("href") || ""); return m ? m[1] : null; };
+  const anchors = [...document.querySelectorAll("a[href]")].filter(a => pidOf(a) === pid);
+  if (!anchors.length) return "not-listed";
+  const isAdd = x => /^\s*(add to cart|move to cart|add to bag)\s*$/i.test((x.innerText || x.value || "").trim());
+  const visible = x => x.offsetParent !== null || getComputedStyle(x).position === "fixed";
+  const pidsIn = el => { const s = new Set(); el.querySelectorAll("a[href]").forEach(a => { const p = pidOf(a); if (p) s.add(p); }); return s; };
+  for (const a of anchors) {
+    let box = a, depth = 0;
+    while (box.parentElement && box.parentElement !== document.body && depth++ < 12) {
+      const s = pidsIn(box.parentElement);
+      if (s.size > 1 || (s.size === 1 && !s.has(pid))) break;
+      box = box.parentElement;
+    }
+    const cb = box.querySelector("input[type=checkbox]");
+    const own = [...box.querySelectorAll("button, a, div, span, input")].find(x => isAdd(x) && visible(x));
+    if (own) { if (cb && !cb.checked) cb.click(); own.setAttribute("data-hw-target", "1"); return "ok"; }
+    if (cb) {
+      if (!cb.checked) cb.click();
+      const g = [...document.querySelectorAll("button, a, div, span, input")].find(x => isAdd(x) && visible(x));
+      if (g) { g.setAttribute("data-hw-target", "1"); return "ok"; }
     }
   }
   return "no-add-button";
