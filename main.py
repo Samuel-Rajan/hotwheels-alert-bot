@@ -1,4 +1,5 @@
 import os
+import io
 import asyncio
 import html
 import logging
@@ -91,6 +92,21 @@ async def send_cart_result(bot: Bot, item: dict, res: dict):
     await send_text(bot, "\n".join(lines))
 
 
+async def send_evidence(bot: Bot, item: dict, res: dict):
+    """On a cart failure, send FirstCry's real card markup so the selectors can be fixed from facts."""
+    ev = res.get("evidence") or {}
+    try:
+        if ev.get("probe"):
+            await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=io.BytesIO(ev["probe"].encode("utf-8")),
+                                    filename=f"probe_{item['id']}.json",
+                                    caption="🔧 Debug: what is inside this car's card. Send this file and the next one to Claude.")
+        if ev.get("card_html"):
+            await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=io.BytesIO(ev["card_html"].encode("utf-8")),
+                                    filename=f"card_{item['id']}.html")
+    except Exception as e:
+        logging.warning(f"Could not send debug files: {e}")
+
+
 async def monitor_stock():
     t0 = time.monotonic()
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -157,6 +173,7 @@ async def monitor_stock():
         fc_items = [i for i in confirmed if i["platform"] == "FirstCry"]
         if fc_items:
             session = await CartSession.create(browser)
+            evidence_sent = False
             try:
                 for item in fc_items[:MAX_CART_ITEMS]:
                     if time.monotonic() - t0 > RUN_BUDGET:
@@ -167,6 +184,9 @@ async def monitor_stock():
                     res = await session.add(item, deadline)
                     logging.info(f"Cart result for {item['id']}: {res}")
                     await send_cart_result(bot, item, res)
+                    if res["status"] == "failed" and res.get("evidence") and not evidence_sent:
+                        await send_evidence(bot, item, res)
+                        evidence_sent = True
             finally:
                 await session.close()
         if len(fc_items) > MAX_CART_ITEMS:
