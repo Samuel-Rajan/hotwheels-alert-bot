@@ -116,29 +116,49 @@ _CARD_SHORTLIST_JS = r"""
 (pid) => {
   document.querySelectorAll("[data-hw-sl]").forEach(x => x.removeAttribute("data-hw-sl"));
   const PID = /\/(\d+)\/product-detail/;
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
-  let cur = null, seenCard = false, found = null, addSeen = false, oosSeen = false, n;
-  while ((n = walker.nextNode())) {
-    if (n.nodeType === 1) {
-      if (n.tagName === "A" && n.querySelector("img")) {
-        const m = PID.exec(n.getAttribute("href") || "");
-        if (m) { cur = m[1]; if (cur === pid) seenCard = true; }
-      }
-      continue;
+  const links = [...document.querySelectorAll("a[href*='/product-detail']")].filter(a => a.querySelector("img"));
+  const pids = links.map(a => (PID.exec(a.getAttribute("href") || "") || [])[1]);
+  const FOLLOW = Node.DOCUMENT_POSITION_FOLLOWING, PREC = Node.DOCUMENT_POSITION_PRECEDING;
+  const SL = /short\s*-?_?list|wish\s*-?_?list/i;
+  const STATE = /shortlisted|my\s*shortlist/i;
+  const own = el => [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.nodeValue.trim()).filter(Boolean).join(" ");
+  const shown = el => { const r = el.getBoundingClientRect(); const cs = getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none"; };
+  let anyCard = false, anyOos = false, anyAdd = false;
+  for (let i = 0; i < links.length; i++) {
+    if (pids[i] !== pid) continue;
+    anyCard = true;
+    const mine = links[i];
+    let next = null;
+    for (let j = i + 1; j < links.length; j++) { if (pids[j] !== pid) { next = links[j]; break; } }
+    const els = [...document.querySelectorAll("body *")].filter(el =>
+      !/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(el.tagName) &&
+      (mine.compareDocumentPosition(el) & FOLLOW) &&
+      (!next || ((next.compareDocumentPosition(el) & PREC) && !el.contains(next))));
+    for (const el of els) {
+      const t = own(el);
+      if (/^add to cart$/i.test(t)) anyAdd = true;
+      if (/notify me|out of stock|sold out/i.test(t)) anyOos = true;
     }
-    if (cur !== pid) continue;
-    const t = (n.nodeValue || "").trim();
-    if (!t) continue;
-    if (!found && /^shortlist$/i.test(t)) found = n.parentElement;
-    if (/^add to cart$/i.test(t)) addSeen = true;
-    if (/notify me|out of stock|sold out/i.test(t)) oosSeen = true;
+    const tiers = [
+      ["text",     els.filter(el => /^(add to )?shortlist$/i.test(own(el)))],
+      ["textlike", els.filter(el => SL.test(own(el)) && !STATE.test(own(el)))],
+      ["onclick",  els.filter(el => SL.test(el.getAttribute("onclick") || "") && !STATE.test(own(el)))],
+      ["label",    els.filter(el => SL.test((el.getAttribute("title") || "") + " " + (el.getAttribute("aria-label") || "") + " " + (el.getAttribute("alt") || "")) && !STATE.test(own(el)))],
+      ["class",    els.filter(el => SL.test(String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : el.className) + " " + (el.id || "")) && !STATE.test(String(el.className) + own(el)))],
+      ["pseudo",   els.filter(el => ["::before", "::after"].some(p => SL.test(getComputedStyle(el, p).content || "")))],
+    ];
+    for (const [how, list] of tiers) {
+      if (!list.length) continue;
+      const pick = list.find(shown) || list[0];
+      pick.scrollIntoView({block: "center"});
+      pick.setAttribute("data-hw-sl", "1");
+      return "ok:" + how;
+    }
   }
-  if (!seenCard) return "no-card";
-  if (oosSeen && !addSeen) return "oos";
-  if (!found) return "no-button";
-  found.scrollIntoView({block: "center"});
-  found.setAttribute("data-hw-sl", "1");
-  return "ok";
+  if (!anyCard) return "no-card";
+  if (anyOos && !anyAdd) return "oos";
+  return "no-button";
 }
 """
 
@@ -179,6 +199,38 @@ _CARD_HTML_JS = r"""
     out = el.outerHTML;
   }
   return (out || card.outerHTML).slice(0, 14000);
+}
+"""
+
+_SEGMENT_PROBE_JS = r"""
+(pid) => {
+  const PID = /\/(\d+)\/product-detail/;
+  const links = [...document.querySelectorAll("a[href*='/product-detail']")].filter(a => a.querySelector("img"));
+  const pids = links.map(a => (PID.exec(a.getAttribute("href") || "") || [])[1]);
+  const i = pids.indexOf(pid);
+  if (i < 0) return {error: "no card for pid " + pid};
+  const mine = links[i];
+  let next = null;
+  for (let j = i + 1; j < links.length; j++) { if (pids[j] !== pid) { next = links[j]; break; } }
+  const FOLLOW = Node.DOCUMENT_POSITION_FOLLOWING, PREC = Node.DOCUMENT_POSITION_PRECEDING;
+  const els = [...document.querySelectorAll("body *")].filter(el =>
+    !/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(el.tagName) &&
+    (mine.compareDocumentPosition(el) & FOLLOW) && (!next || ((next.compareDocumentPosition(el) & PREC) && !el.contains(next))));
+  const own = el => [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.nodeValue.trim()).filter(Boolean).join(" ");
+  const texts = [...new Set(els.map(own).filter(Boolean))].slice(0, 80);
+  const hint = /short|wish|heart|fav|save|like/i;
+  const controls = els.filter(el => hint.test(String(el.className) + " " + (el.id || "") + " " + (el.getAttribute("onclick") || "")
+                    + " " + (el.getAttribute("title") || "") + " " + (el.getAttribute("aria-label") || "")))
+    .slice(0, 30).map(el => ({tag: el.tagName, cls: String(el.className).slice(0, 120), id: el.id || "",
+       text: own(el).slice(0, 60), onclick: (el.getAttribute("onclick") || "").slice(0, 160),
+       title: el.getAttribute("title") || "", aria: el.getAttribute("aria-label") || "",
+       shown: (() => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; })()}));
+  let wrap = mine, out = "";
+  for (let k = 0; k < 8 && wrap.parentElement; k++, wrap = wrap.parentElement) {
+    if (next && wrap.contains(next)) break;
+    out = wrap.outerHTML;
+  }
+  return {texts, controls, html: out.slice(0, 14000)};
 }
 """
 
@@ -322,14 +374,22 @@ class CartSession:
         return "not-found"
 
     async def _dump_card(self, item: dict, mode: str):
+        """Save what FirstCry's markup really looks like; returned so main.py can send it to Telegram."""
+        evidence = {}
         try:
             scraper.DEBUG_DIR.mkdir(exist_ok=True)
             if mode == "card":
-                html_ = await self.listing.evaluate(_CARD_HTML_JS, item["id"])
-                (scraper.DEBUG_DIR / f"card_{item['id']}.html").write_text(html_ or "(card not found)", encoding="utf-8")
+                probe = await self.listing.evaluate(_SEGMENT_PROBE_JS, item["id"])
+                evidence["card_html"] = (probe.get("html") or "(none)") if isinstance(probe, dict) else str(probe)
+                probe_txt = json.dumps({k: v for k, v in probe.items() if k != "html"}, indent=1, ensure_ascii=False) \
+                    if isinstance(probe, dict) else str(probe)
+                evidence["probe"] = probe_txt
+                (scraper.DEBUG_DIR / f"card_{item['id']}.html").write_text(evidence["card_html"], encoding="utf-8")
+                (scraper.DEBUG_DIR / f"probe_{item['id']}.json").write_text(probe_txt, encoding="utf-8")
             await debug_dump(self.listing, f"listing_{item['id']}", force=True)
         except Exception as e:
             logging.warning(f"[cart] card dump failed: {e}")
+        return evidence
 
     async def add(self, item: dict, deadline: float) -> dict:
         """
@@ -365,16 +425,25 @@ class CartSession:
                 if not already:
                     if mode == "card":
                         r = await self.listing.evaluate(_CARD_SHORTLIST_JS, pid)
+                        if r == "no-button":
+                            # some sites only inject the control on hover
+                            try:
+                                await self.listing.locator(f"a[href*='/{pid}/product-detail']:has(img)").first.hover(timeout=3000)
+                                await self.listing.wait_for_timeout(500)
+                                r = await self.listing.evaluate(_CARD_SHORTLIST_JS, pid)
+                            except Exception:
+                                pass
                     else:
                         r = await self.listing.evaluate(_PAGE_SHORTLIST_JS)
                     if r == "oos":
                         res["status"], res["detail"] = "sold_out", "listing card shows out of stock"
                         return res
-                    if r != "ok":
+                    if not str(r).startswith("ok"):
                         res["detail"] = f"shortlist control: {r} ({mode})"
                         if attempt == 1:
-                            await self._dump_card(item, mode)
+                            res["evidence"] = await self._dump_card(item, mode)
                         continue
+                    logging.info(f"[cart] {pid}: Shortlist control found via {r}")
                     if not await _click_tagged(self.listing, "[data-hw-sl='1']"):
                         res["detail"] = "could not click Shortlist"
                         continue
@@ -382,8 +451,6 @@ class CartSession:
                     if not await _shortlist_has(self.shortlist, item):
                         res["detail"] = ("clicked Shortlist but the car is not on My Shortlist "
                                          "(shortlisting needs a logged-in session)")
-                        if attempt == 1:
-                            await self._dump_card(item, mode)
                         continue
 
                 # 2) Add it to the cart from the shortlist page
