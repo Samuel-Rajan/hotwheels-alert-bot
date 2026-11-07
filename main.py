@@ -3,6 +3,7 @@ import io
 import asyncio
 import html
 import logging
+import threading
 import time
 
 from telegram import Bot
@@ -15,11 +16,14 @@ from db import (init_db, is_first_run, mark_seeded, check_item, mark_missing, ma
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-MAX_VERIFY = 12          # candidates verified/alerted per run (extras are retried next run)
+MAX_VERIFY = 10          # candidates verified/alerted per run (extras are retried next run)
+GATE_MAX = 6             # candidates per run that get the My Shortlist deliverability check before alerting
+GATE_BUDGET = 60         # seconds allowed per deliverability check
 MAX_CART_ITEMS = 3       # items per run that get the add-to-cart treatment
-RUN_BUDGET = 400         # seconds after which no new cart job is started
-CART_ITEM_BUDGET = 200   # seconds allowed per item for the wishlist -> cart retries
-HARD_STOP = 515          # never run cart work past this many seconds into the run
+RUN_BUDGET = 330         # seconds after which no new gate/cart job is started
+CART_ITEM_BUDGET = 150   # seconds allowed per item for the wishlist -> cart retries
+HARD_STOP = 500          # never run browser work past this many seconds into the run
+WATCHDOG = 585           # the process is force-exited after this many seconds, whatever happens
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -39,18 +43,21 @@ async def send_text(bot: Bot, text: str):
         logging.error(f"Telegram send failed: {e}")
 
 
-async def send_stock_alert(bot: Bot, item: dict, stock_status: str) -> bool:
+async def send_stock_alert(bot: Bot, item: dict, stock_status: str, gate: dict = None) -> bool:
     title = html.escape(item.get("title", "Hot Wheels Product"))
     platform = html.escape(item.get("platform", "Store"))
     price = html.escape(item.get("price", "Check App"))
     link = html.escape(item.get("link", ""), quote=True)
-    check = {"in": "✅ Verified on product page", "unknown": "⚠️ Listing says in stock (product page not verified)"}
+    check = "✅ Verified on product page" if stock_status == "in" else "⚠️ Listing says in stock (product page not verified)"
+    if gate and gate.get("state") == "ok":
+        pin = f" {html.escape(gate['pincode'])}" if gate.get("pincode") else ""
+        check += f"\n📍 Deliverable to your pincode{pin} ✅"
     message = (
         "🔥 <b>HOT WHEELS STOCK / RESTOCK ALERT!</b> 🔥\n\n"
         f"🏎️ <b>Product:</b> {title}\n"
         f"🏬 <b>Store:</b> {platform}\n"
         f"💰 <b>Price:</b> {price}\n"
-        f"{check.get(stock_status, '')}\n\n"
+        f"{check}\n\n"
         f"🔗 <a href='{link}'><b>Open this car &amp; buy now</b></a>\n"
         "🛒 Adding it to your cart via Wishlist now…"
     )
@@ -73,10 +80,13 @@ async def send_cart_result(bot: Bot, item: dict, res: dict):
     title = html.escape(item["title"][:80])
     link = html.escape(item["link"], quote=True)
     st = res["status"]
+    pin = f" (pincode {html.escape(res['pincode'])})" if res.get("pincode") else ""
     if st == "added":
         head = f"🛒 <b>In your cart ✅</b> via Wishlist (attempt {res['tries']}/{CART_ATTEMPTS})"
     elif st == "sold_out":
         head = "⚠️ <b>Sold out before I could add it</b>"
+    elif st == "undeliverable":
+        head = f"🚫 <b>Not deliverable to your pincode{pin}</b>: FirstCry won't let you add this car."
     else:
         head = (f"❌ <b>Could not confirm it in the cart</b> after {res['tries']} wishlist → cart attempts. "
                 f"Open the link and add it manually.")
@@ -149,38 +159,59 @@ async def monitor_stock():
             candidates = extra + candidates
             logging.info(f"TEST MODE: {len(extra)} existing item(s) added as candidates")
 
-        # ---------------- Phase 1: verify on product page, then alert immediately
         confirmed, alerts = [], 0
-        if candidates:
-            verifier = await Verifier.create(browser)
-            try:
-                for n, item in enumerate(candidates):
-                    key, is_test = item["key"], item["key"] in test_keys
-                    if n >= MAX_VERIFY:
-                        if not is_test:
-                            forget(key)          # retry on the next run
-                        continue
-                    status = await verifier.status(item) if item["platform"] == "FirstCry" else "unknown"
-                    logging.info(f"Candidate {item['title'][:50]} -> product page: {status}")
-                    if status == "out":
-                        if not is_test:
-                            mark_out(key)        # listing was wrong; alert on the real restock
-                        continue
-                    if await send_stock_alert(bot, item, status):
-                        alerts += 1
-                        confirmed.append(item)
-                    elif not is_test:
-                        forget(key)              # alert failed: retry next run
-                    await asyncio.sleep(1)
-            finally:
-                await verifier.close()
+        verifier = session = None
+        evidence_sent = False
+        try:
+            if candidates:
+                verifier = await Verifier.create(browser)
+                if any(c["platform"] == "FirstCry" for c in candidates):
+                    session = await CartSession.create(browser)
 
-        # ---------------- Phase 2: add to cart (after all alerts are out)
-        fc_items = [i for i in confirmed if i["platform"] == "FirstCry"]
-        if fc_items:
-            session = await CartSession.create(browser)
-            evidence_sent = False
-            try:
+            # ---------------- Phase 1: verify, check deliverability, then alert
+            gates_done = 0
+            for n, item in enumerate(candidates):
+                key, is_test = item["key"], item["key"] in test_keys
+                if n >= MAX_VERIFY:
+                    if not is_test:
+                        forget(key)          # retry on the next run
+                    continue
+                is_fc = item["platform"] == "FirstCry"
+                status = await verifier.status(item) if is_fc else "unknown"
+                logging.info(f"Candidate {item['title'][:50]} -> product page: {status}")
+                if status in ("out", "undeliverable"):
+                    if not is_test:
+                        mark_out(key)        # listing was wrong / not deliverable; alert on a real restock
+                    else:
+                        await send_text(bot, f"🧪 Test: skipped ({status}) {html.escape(item['title'][:70])}")
+                    continue
+
+                gate = None
+                if (session and is_fc and gates_done < GATE_MAX and time.monotonic() - t0 < RUN_BUDGET):
+                    gates_done += 1
+                    gate = await session.gate(item, min(time.monotonic() + GATE_BUDGET, t0 + HARD_STOP))
+                    logging.info(f"Gate {item['id']}: {gate.get('state')} ({gate.get('detail')})")
+                    if gate.get("evidence") and not evidence_sent:
+                        await send_evidence(bot, item, {"evidence": gate["evidence"]})
+                        evidence_sent = True
+                    if gate["state"] in ("undeliverable", "oos"):
+                        if not is_test:
+                            mark_out(key)
+                        else:
+                            await send_text(bot, f"🧪 Test: skipped, FirstCry shows it as {gate['state']} "
+                                                 f"(pincode {gate.get('pincode') or '?'}): {html.escape(item['title'][:70])}")
+                        continue
+
+                if await send_stock_alert(bot, item, status, gate):
+                    alerts += 1
+                    confirmed.append(item)
+                elif not is_test:
+                    forget(key)              # alert failed: retry next run
+                await asyncio.sleep(1)
+
+            # ---------------- Phase 2: add to cart (after all alerts are out)
+            fc_items = [i for i in confirmed if i["platform"] == "FirstCry"]
+            if session:
                 for item in fc_items[:MAX_CART_ITEMS]:
                     if time.monotonic() - t0 > RUN_BUDGET:
                         await send_text(bot, f"⏱️ Skipped cart attempt (run time budget): "
@@ -193,11 +224,16 @@ async def monitor_stock():
                     if res["status"] == "failed" and res.get("evidence") and not evidence_sent:
                         await send_evidence(bot, item, res)
                         evidence_sent = True
-            finally:
-                await session.close()
-        if len(fc_items) > MAX_CART_ITEMS:
-            await send_text(bot, f"ℹ️ {len(fc_items) - MAX_CART_ITEMS} more car(s) alerted without a cart attempt "
-                                 f"(limit {MAX_CART_ITEMS} per run).")
+            if len(fc_items) > MAX_CART_ITEMS:
+                await send_text(bot, f"ℹ️ {len(fc_items) - MAX_CART_ITEMS} more car(s) alerted without a cart attempt "
+                                     f"(limit {MAX_CART_ITEMS} per run).")
+        finally:
+            for closer in (verifier, session):
+                if closer:
+                    try:
+                        await asyncio.wait_for(closer.close(), timeout=10)
+                    except Exception:
+                        pass
 
     if first_run and items:
         mark_seeded()
@@ -206,11 +242,21 @@ async def monitor_stock():
     logging.info(f"Done in {time.monotonic() - t0:.0f}s. Alerts sent: {alerts}")
 
 
+def _watchdog():
+    logging.error(f"❌ Watchdog: run exceeded {WATCHDOG}s, forcing exit so the database can still be saved.")
+    os._exit(0)
+
+
 if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram credentials missing from environment variables!")
         raise SystemExit(1)
+    timer = threading.Timer(WATCHDOG, _watchdog)
+    timer.daemon = True
+    timer.start()
     try:
         asyncio.run(asyncio.wait_for(monitor_stock(), timeout=540.0))
     except asyncio.TimeoutError:
         logging.error("❌ Execution timed out after 540 seconds and was aborted.")
+    finally:
+        timer.cancel()
