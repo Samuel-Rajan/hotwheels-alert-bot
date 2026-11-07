@@ -1,11 +1,12 @@
 """
-Stock verification + add-to-cart for FirstCry.
+Stock verification, deliverability gate and add-to-cart for FirstCry.
 
-* Verifier     : opens the product page and confirms an ADD TO CART button really exists
-                 (so we never alert for a car that is not actually buyable).
-* CartSession  : puts a car in the cart WITHOUT opening the product page:
-                   listing page card -> Shortlist (wishlist) -> My Shortlist -> Add to cart -> check cart
-                 repeated up to CART_ATTEMPTS times (default 10) until the car is visible in the cart.
+* Verifier     : opens the product page and confirms an ADD TO CART button really exists.
+* CartSession  : works through the Wishlist, WITHOUT opening the product page to add:
+                   listing card -> Shortlist -> My Shortlist -> (read the car's row) -> Add to cart -> check cart
+                 - gate(): shortlists the car and reads its row on My Shortlist. The row says ADD TO CART when the car
+                           is buyable at the session's delivery pincode, or "Undeliverable / Out of stock" when not.
+                 - add():  clicks the row's Add to cart, up to CART_ATTEMPTS times, until the car is visible in the cart.
 
 To fill YOUR account's cart (not an anonymous guest cart) set the FIRSTCRY_STATE_B64 secret
 (see login_helper.py). The bot never checks out or pays.
@@ -31,7 +32,7 @@ LISTING_URLS = scraper.PLATFORMS[0]["urls"]
 ADD_BTN = re.compile(r"^\s*(add to cart)\s*$", re.I)
 GO_CART = re.compile(r"^\s*(go to cart|view cart)\s*$", re.I)
 OOS_RE = re.compile(r"^\s*(notify me|out of stock|sold out|currently unavailable)\s*$", re.I)
-LOGIN_LINK = re.compile(r"^\s*login\s*/\s*register\s*$", re.I)
+UNDELIVERABLE_RE = re.compile(r"not deliverable|undeliverable|not serviceable|cannot be delivered|can.?t be delivered", re.I)
 SHOW_MORE = re.compile(r"^\s*show more products\s*$", re.I)
 
 
@@ -69,7 +70,7 @@ async def _first_visible(loc, limit: int = 10):
 
 async def _settle(page, ms: int = 800):
     try:
-        await page.wait_for_load_state("networkidle", timeout=8000)
+        await page.wait_for_load_state("networkidle", timeout=3000)   # FirstCry never fully idles; don't wait long
     except Exception:
         pass
     await page.wait_for_timeout(ms)
@@ -79,39 +80,12 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
 
-# --------------------------------------------------------------------------- stock verification
-class Verifier:
-    """Guest browser page used to confirm that a listing's 'in stock' is real."""
-
-    def __init__(self, ctx, page):
-        self.ctx, self.page = ctx, page
-
-    @classmethod
-    async def create(cls, browser):
-        ctx = await browser.new_context(**DESKTOP_CTX)
-        return cls(ctx, await ctx.new_page())
-
-    async def status(self, item: dict) -> str:
-        """'in' (ADD TO CART visible), 'out' (notify/out-of-stock visible), or 'unknown'."""
-        page = self.page
-        try:
-            await page.goto(item["link"], wait_until="domcontentloaded", timeout=30000)
-            await _settle(page, 600)
-            if await _first_visible(page.get_by_text(ADD_BTN)) or await _first_visible(page.get_by_text(GO_CART)):
-                return "in"
-            if await _first_visible(page.get_by_text(OOS_RE)):
-                return "out"
-            return "unknown"
-        except Exception as e:
-            logging.warning(f"[verify] {item['id']}: {e}")
-            return "unknown"
-
-    async def close(self):
-        await self.ctx.close()
+def _title_key(item: dict) -> str:
+    return _norm(item["title"])[:45]
 
 
-# --------------------------------------------------------------------------- page helpers (JS)
-# Finds the Shortlist control inside the listing card of product `pid` and tags it data-hw-sl.
+# =========================================================================== JS used on the pages
+# Finds the Shortlist control of product `pid` on the LISTING (text, onclick, label, class, CSS text).
 _CARD_SHORTLIST_JS = r"""
 (pid) => {
   document.querySelectorAll("[data-hw-sl]").forEach(x => x.removeAttribute("data-hw-sl"));
@@ -162,7 +136,7 @@ _CARD_SHORTLIST_JS = r"""
 }
 """
 
-# Same control, but on a product page (used when a car has no card of its own on the listing).
+# Same control on a product page (used when a car has no card of its own on the listing).
 _PAGE_SHORTLIST_JS = r"""
 () => {
   document.querySelectorAll("[data-hw-sl]").forEach(x => x.removeAttribute("data-hw-sl"));
@@ -172,7 +146,7 @@ _PAGE_SHORTLIST_JS = r"""
     const t = (n.nodeValue || "").trim();
     const p = n.parentElement;
     if (!p || !/^(add to )?(shortlist|wishlist)$/i.test(t)) continue;
-    if (p.closest("a[href*='myshortlist']")) continue;          // skip the header "Shortlist" link
+    if (p.closest("a[href*='myshortlist']")) continue;
     if (!found || (p.offsetParent !== null && found.offsetParent === null)) found = p;
   }
   if (!found) return "no-button";
@@ -182,26 +156,7 @@ _PAGE_SHORTLIST_JS = r"""
 }
 """
 
-# Returns the card's HTML so a failed run leaves evidence of FirstCry's real markup.
-_CARD_HTML_JS = r"""
-(pid) => {
-  const PID = /\/(\d+)\/product-detail/;
-  const imgLinks = [...document.querySelectorAll("a[href*='/product-detail']")].filter(a => a.querySelector("img"));
-  const mine = imgLinks.find(a => (PID.exec(a.getAttribute("href") || "") || [])[1] === pid);
-  if (!mine) return "";
-  let card = mine, depth = 0;
-  while (card.parentElement && card.parentElement !== document.body && depth++ < 6) card = card.parentElement;
-  const idx = imgLinks.indexOf(mine);
-  let el = mine, out = "";
-  for (let i = 0; i < 8 && el.parentElement; i++, el = el.parentElement) {
-    const next = imgLinks[idx + 1];
-    if (next && el.contains(next)) break;
-    out = el.outerHTML;
-  }
-  return (out || card.outerHTML).slice(0, 14000);
-}
-"""
-
+# What is inside this car's card (for debugging): texts, controls, HTML.
 _SEGMENT_PROBE_JS = r"""
 (pid) => {
   const PID = /\/(\d+)\/product-detail/;
@@ -223,8 +178,7 @@ _SEGMENT_PROBE_JS = r"""
                     + " " + (el.getAttribute("title") || "") + " " + (el.getAttribute("aria-label") || "")))
     .slice(0, 30).map(el => ({tag: el.tagName, cls: String(el.className).slice(0, 120), id: el.id || "",
        text: own(el).slice(0, 60), onclick: (el.getAttribute("onclick") || "").slice(0, 160),
-       title: el.getAttribute("title") || "", aria: el.getAttribute("aria-label") || "",
-       shown: (() => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; })()}));
+       title: el.getAttribute("title") || "", aria: el.getAttribute("aria-label") || ""}));
   let wrap = mine, out = "";
   for (let k = 0; k < 8 && wrap.parentElement; k++, wrap = wrap.parentElement) {
     if (next && wrap.contains(next)) break;
@@ -234,9 +188,9 @@ _SEGMENT_PROBE_JS = r"""
 }
 """
 
+# After a Shortlist click: did a login popup appear? does the card now show "Shortlisted"?
 _CARD_STATE_JS = r"""
 (pid) => {
-  // popup: a visible overlay that looks like a login / OTP prompt
   let popup = "";
   for (const e of document.querySelectorAll("body *")) {
     const cs = getComputedStyle(e);
@@ -247,7 +201,6 @@ _CARD_STATE_JS = r"""
     const t = (e.innerText || "").trim();
     if (/log\s*in|sign\s*in|register|otp|mobile\s*(no|number)/i.test(t)) { popup = t.slice(0, 220); break; }
   }
-  // badge: does this car's card now show the "Shortlisted" state?
   const PID = /\/(\d+)\/product-detail/;
   const links = [...document.querySelectorAll("a[href*='/product-detail']")].filter(a => a.querySelector("img"));
   const pids = links.map(a => (PID.exec(a.getAttribute("href") || "") || [])[1]);
@@ -280,7 +233,8 @@ _SHORTLIST_PROBE_JS = r"""
   title: document.title,
   text: (document.body.innerText || "").slice(0, 2500),
   product_links: [...document.querySelectorAll("a[href]")].map(a => a.getAttribute("href"))
-                  .filter(h => /product-detail/.test(h || "")).slice(0, 40),
+                  .filter(h => /product-detail|pdp|product/.test(h || "")).slice(0, 40),
+  images: [...document.images].map(i => i.currentSrc || i.src).slice(0, 30),
 })
 """
 
@@ -288,38 +242,77 @@ _HAS_CARD_JS = r"""
 (pid) => [...document.querySelectorAll("a[href*='/" + pid + "/product-detail']")].some(a => a.querySelector("img"))
 """
 
-# On the My Shortlist page: finds the 'Add to cart' control belonging to product `pid` (ticks its checkbox).
-_SHORTLIST_ADD_JS = r"""
-(pid) => {
+# Is the car on the My Shortlist page? (FirstCry's My Shortlist has NO product links, so also match the name.)
+_PAGE_HAS_JS = r"""
+({pid, key}) => {
+  if (document.querySelector("a[href*='/" + pid + "/']")) return "href";
+  if (document.querySelector("img[src*='" + pid + "']")) return "img";
+  if (document.querySelector("[href*='" + pid + "'], [data-pid='" + pid + "'], [data-productid='" + pid + "']")) return "attr";
+  if (key) {
+    const txt = (document.body.innerText || "").toLowerCase().replace(/[^a-z0-9]+/g, " ");
+    if (txt.includes(key)) return "title";
+  }
+  return "";
+}
+"""
+
+# The car's ROW on My Shortlist. Reads the text that follows the car's name, up to the next car:
+#   "ADD TO CART"                     -> buyable here  (tags that button)
+#   "Undeliverable / not deliverable" -> cannot be delivered to the session's pincode
+#   "NOTIFY ME / OUT OF STOCK"        -> out of stock
+_SHORTLIST_ROW_JS = r"""
+({key}) => {
   document.querySelectorAll("[data-hw-target]").forEach(x => x.removeAttribute("data-hw-target"));
-  const PID = /\/(\d+)\/product-detail/;
-  const pidOf = a => { const m = PID.exec(a.getAttribute("href") || ""); return m ? m[1] : null; };
-  const anchors = [...document.querySelectorAll("a[href]")].filter(a => pidOf(a) === pid);
-  if (!anchors.length) return "not-listed";
+  const norm = s => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let n, started = false, add = null, flags = "";
+  while ((n = w.nextNode())) {
+    const p = n.parentElement;
+    if (!p || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(p.tagName)) continue;
+    const t = (n.nodeValue || "").trim();
+    if (!t) continue;
+    if (!started) { if (key && norm(t).includes(key)) started = true; continue; }
+    if (/^hot wheels/i.test(t) || /^(international|remove all)$/i.test(t) || /^\d+ left$/i.test(t)) break;
+    if (!add && /^add to cart$/i.test(t)) add = p;
+    flags += " " + t.toLowerCase();
+  }
+  if (!started) return "not-listed";
+  if (add) { add.setAttribute("data-hw-target", "1"); return "ok"; }
+  if (/undeliverable|not deliverable/.test(flags)) return "undeliverable";
+  if (/out of stock|notify me/.test(flags)) return "oos";
+  return "no-add-button";
+}
+"""
+
+# Fallback for a My Shortlist layout where cars DO have links: nearest Add-to-cart to the car's link/image.
+_SHORTLIST_ADD_ANCHOR_JS = r"""
+({pid, key}) => {
+  document.querySelectorAll("[data-hw-target]").forEach(x => x.removeAttribute("data-hw-target"));
+  let anchor = document.querySelector("a[href*='/" + pid + "/']") || document.querySelector("img[src*='" + pid + "']")
+            || document.querySelector("[href*='" + pid + "'], [data-pid='" + pid + "'], [data-productid='" + pid + "']");
+  if (!anchor) return "not-listed";
   const isAdd = x => /^\s*(add to cart|move to cart|add to bag)\s*$/i.test((x.innerText || x.value || "").trim());
   const visible = x => x.offsetParent !== null || getComputedStyle(x).position === "fixed";
-  const pidsIn = el => { const s = new Set(); el.querySelectorAll("a[href]").forEach(a => { const p = pidOf(a); if (p) s.add(p); }); return s; };
-  for (const a of anchors) {
-    let box = a, depth = 0;
-    while (box.parentElement && box.parentElement !== document.body && depth++ < 12) {
-      const s = pidsIn(box.parentElement);
-      if (s.size > 1 || (s.size === 1 && !s.has(pid))) break;
-      box = box.parentElement;
-    }
-    const cb = box.querySelector("input[type=checkbox]");
-    const own = [...box.querySelectorAll("button, a, div, span, input")].find(x => isAdd(x) && visible(x));
-    if (own) { if (cb && !cb.checked) cb.click(); own.setAttribute("data-hw-target", "1"); return "ok"; }
-    if (cb) {
-      if (!cb.checked) cb.click();
-      const g = [...document.querySelectorAll("button, a, div, span, input")].find(x => isAdd(x) && visible(x));
-      if (g) { g.setAttribute("data-hw-target", "1"); return "ok"; }
-    }
+  const centre = x => { const r = x.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; };
+  const dist = (a, b) => { const p = centre(a), q = centre(b); return Math.hypot(p[0] - q[0], p[1] - q[1]); };
+  const nearest = list => list.slice().sort((a, b) => dist(a, anchor) - dist(b, anchor))[0];
+  const ADD_SEL = "button, a, div, span, input";
+  let box = anchor;
+  for (let depth = 0; depth < 10 && box; depth++, box = box.parentElement) {
+    const adds = [...box.querySelectorAll(ADD_SEL)].filter(x => isAdd(x) && visible(x));
+    if (!adds.length) continue;
+    const pick = nearest(adds);
+    const cbs = [...box.querySelectorAll("input[type=checkbox]")];
+    if (cbs.length) { const cb = nearest(cbs); if (!cb.checked) cb.click(); }
+    pick.setAttribute("data-hw-target", "1");
+    return "ok";
   }
   return "no-add-button";
 }
 """
 
 
+# =========================================================================== small page helpers
 async def _click_tagged(page, selector: str) -> bool:
     loc = page.locator(selector).first
     try:
@@ -336,7 +329,7 @@ async def _click_tagged(page, selector: str) -> bool:
 async def _is_logged_in(page):
     """True/False from the header; None if it could not be determined."""
     try:
-        if await _first_visible(page.get_by_text(LOGIN_LINK)):
+        if await _first_visible(page.get_by_text(re.compile(r"^\s*login\s*/\s*register\s*$", re.I))):
             return False
         if await _first_visible(page.get_by_text(re.compile(r"my account", re.I))):
             return True
@@ -345,36 +338,132 @@ async def _is_logged_in(page):
     return None
 
 
-async def _cart_contains(cart_page, item: dict) -> bool:
+async def _header_text(page) -> str:
+    try:
+        return await page.evaluate("() => (document.body.innerText || '').slice(0, 900)")
+    except Exception:
+        return ""
+
+
+async def _read_pincode(page):
+    m = re.search(r"select location\s*(\d{6})", await _header_text(page), re.I)
+    return m.group(1) if m else None
+
+
+async def _cart_count(page):
+    """The number next to the Cart icon in the header (None if not found)."""
+    m = re.search(r"(\d+)\s*Cart\b", await _header_text(page), re.I)
+    return int(m.group(1)) if m else None
+
+
+async def _cart_contains(cart_page, item: dict, before=None) -> bool:
+    """True if the cart counter went up, or the car shows in the cart (by link, image or name)."""
     try:
         await cart_page.goto(CART_URL, wait_until="domcontentloaded", timeout=30000)
         await _settle(cart_page, 1000)
-        if await cart_page.locator(f"a[href*='/{item['id']}/']").count():
+        count = await _cart_count(cart_page)
+        if before is not None and count is not None and count > before:
             return True
         body = _norm(await cart_page.inner_text("body"))
         if "your cart is empty" in body:
             return False
-        key = _norm(item["title"])[:28]
+        if await cart_page.locator(f"a[href*='/{item['id']}/'], img[src*='{item['id']}']").count():
+            return True
+        key = _norm(item["title"])[:40]
         return bool(key) and key in body
     except Exception as e:
         logging.warning(f"[cart] check failed: {e}")
         return False
 
 
-async def _shortlist_has(page, item: dict) -> bool:
+async def _shortlist_has(page, item: dict, wait_s: float = 5.0) -> bool:
+    """Is the car on My Shortlist? Checks link, image, attribute and car name; waits for the list to fill in."""
     await page.goto(SHORTLIST_URL, wait_until="domcontentloaded", timeout=30000)
-    await _settle(page, 800)
-    return await page.locator(f"a[href*='/{item['id']}/']").count() > 0
+    await _settle(page, 600)
+    args = {"pid": item["id"], "key": _title_key(item)}
+    end = time.monotonic() + wait_s
+    while True:
+        try:
+            if await page.evaluate(_PAGE_HAS_JS, args):
+                return True
+        except Exception:
+            pass
+        if time.monotonic() > end:
+            return False
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+        await page.wait_for_timeout(900)
 
 
-# --------------------------------------------------------------------------- the cart session
+async def _check_delivery(page):
+    """On a product page: enter the pincode in the delivery box (if there is one) so availability is real."""
+    try:
+        box = page.locator("input[placeholder*='incode' i]:visible").first
+        if not await box.count():
+            return
+        await box.fill(scraper.PINCODE, timeout=2500)
+        btn = page.locator("button:visible, a:visible, div[role=button]:visible, span:visible").filter(
+            has_text=re.compile(r"^\s*(check|apply)\s*$", re.I)).first
+        try:
+            await btn.click(timeout=2000)
+        except Exception:
+            await box.press("Enter")
+        await page.wait_for_timeout(1500)
+    except Exception:
+        pass
+
+
+# =========================================================================== stock verification
+class Verifier:
+    """Guest browser page used to confirm that a listing's 'in stock' is real."""
+
+    def __init__(self, ctx, page):
+        self.ctx, self.page = ctx, page
+
+    @classmethod
+    async def create(cls, browser):
+        ctx = await browser.new_context(**DESKTOP_CTX)
+        return cls(ctx, await ctx.new_page())
+
+    async def status(self, item: dict) -> str:
+        """'in' (ADD TO CART visible), 'undeliverable', 'out' (notify / out of stock visible) or 'unknown'."""
+        page = self.page
+        try:
+            await page.goto(item["link"], wait_until="domcontentloaded", timeout=30000)
+            await _settle(page, 600)
+            await _check_delivery(page)
+            if await _first_visible(page.get_by_text(ADD_BTN)) or await _first_visible(page.get_by_text(GO_CART)):
+                return "in"
+            und = await _first_visible(page.get_by_text(UNDELIVERABLE_RE))
+            if und is not None:
+                try:
+                    if len((await und.inner_text()).strip()) <= 80:      # a status line, not FAQ text
+                        return "undeliverable"
+                except Exception:
+                    pass
+            if await _first_visible(page.get_by_text(OOS_RE)):
+                return "out"
+            return "unknown"
+        except Exception as e:
+            logging.warning(f"[verify] {item['id']}: {e}")
+            return "unknown"
+
+    async def close(self):
+        await self.ctx.close()
+
+
+# =========================================================================== the cart session
 class CartSession:
     """One browser context (logged in if FIRSTCRY_STATE_B64 is set) shared by all cars in a run."""
 
     def __init__(self, ctx, listing, shortlist, cart, logged_in_state):
         self.ctx, self.listing, self.shortlist, self.cart = ctx, listing, shortlist, cart
         self.logged_in = logged_in_state          # False = guest (no state), None = unknown yet
+        self.pincode = None                       # delivery pincode shown in FirstCry's header
         self._listing_url = None
+        self._pin_done = False
 
     @classmethod
     async def create(cls, browser):
@@ -389,16 +478,22 @@ class CartSession:
     async def close(self):
         await self.ctx.close()
 
+    # ---- finding the car on the listing
     async def _find_card(self, item: dict, deadline: float) -> str:
-        """Make sure the car's card is on the listing page (loading more products as needed)."""
         pid = item["id"]
         for url in ([self._listing_url] if self._listing_url else []) + LISTING_URLS:
             if url != self._listing_url:
                 await self.listing.goto(url, wait_until="domcontentloaded", timeout=30000)
                 await _settle(self.listing, 800)
                 self._listing_url = url
+                if not self._pin_done:
+                    self._pin_done = True
+                    if await scraper._set_pincode(self.listing, "cart"):
+                        await self.listing.reload(wait_until="domcontentloaded")
+                        await _settle(self.listing, 800)
                 if self.logged_in is None:
                     self.logged_in = await _is_logged_in(self.listing)
+                self.pincode = await _read_pincode(self.listing) or self.pincode
             stable, last = 0, -1
             for _ in range(60):
                 if time.monotonic() > deadline:
@@ -423,8 +518,23 @@ class CartSession:
             self._listing_url = None            # not on this page; try the next listing URL
         return "not-found"
 
+    async def _locate(self, item: dict, deadline: float, res: dict):
+        """Returns 'card' or 'product' (where the Shortlist button will be clicked), or None on failure."""
+        where = await self._find_card(item, deadline)
+        res["logged_in"] = self.logged_in
+        if where == "found":
+            return "card"
+        if where == "not-found":
+            self._listing_url = None
+            await self.listing.goto(item["link"], wait_until="domcontentloaded", timeout=30000)
+            await _settle(self.listing, 600)
+            logging.info(f"[cart] {item['id']}: no listing card, using the product page's Shortlist button")
+            return "product"
+        res["detail"] = f"could not load the listing ({where})"
+        return None
+
+    # ---- evidence for debugging
     async def _dump_card(self, item: dict, mode: str):
-        """Save what FirstCry's markup really looks like; returned so main.py can send it to Telegram."""
         evidence = {}
         try:
             scraper.DEBUG_DIR.mkdir(exist_ok=True)
@@ -442,7 +552,6 @@ class CartSession:
         return evidence
 
     async def _shortlist_evidence(self, item: dict, state: dict) -> dict:
-        """Facts about WHY the car did not appear on My Shortlist (sent to Telegram)."""
         ev = {}
         try:
             probe = await self.shortlist.evaluate(_SHORTLIST_PROBE_JS)
@@ -454,108 +563,152 @@ class CartSession:
             logging.warning(f"[cart] shortlist evidence failed: {e}")
         return ev
 
+    # ---- step 1: make sure the car is on My Shortlist
+    async def _shortlist_step(self, item: dict, mode: str, attempt: int, res: dict) -> str:
+        """Returns 'ready' (car is on My Shortlist, page loaded), 'retry' (res['detail'] set) or 'final' (res final)."""
+        pid = item["id"]
+        if await _shortlist_has(self.shortlist, item):
+            return "ready"
+        # Clicking Shortlist on a car that is already shortlisted would REMOVE it: check the card's state first.
+        state = await self.listing.evaluate(_CARD_STATE_JS, pid) if mode == "card" else {"popup": "", "badge": None}
+        if state.get("popup"):                       # leftover popup from an earlier click
+            await self.listing.keyboard.press("Escape")
+            await self.listing.wait_for_timeout(300)
+            if mode == "card":
+                state = await self.listing.evaluate(_CARD_STATE_JS, pid)
+        before_popup = state.get("popup", "")
+
+        if not state.get("badge"):
+            if mode == "card":
+                r = await self.listing.evaluate(_CARD_SHORTLIST_JS, pid)
+                if r == "no-button":
+                    try:                             # some sites only inject the control on hover
+                        await self.listing.locator(f"a[href*='/{pid}/product-detail']:has(img)").first.hover(timeout=3000)
+                        await self.listing.wait_for_timeout(500)
+                        r = await self.listing.evaluate(_CARD_SHORTLIST_JS, pid)
+                    except Exception:
+                        pass
+            else:
+                r = await self.listing.evaluate(_PAGE_SHORTLIST_JS)
+            if r == "oos":
+                res["status"], res["detail"] = "sold_out", "listing card shows out of stock"
+                return "final"
+            if not str(r).startswith("ok"):
+                res["detail"] = f"shortlist control: {r} ({mode})"
+                if attempt == 1:
+                    res["evidence"] = await self._dump_card(item, mode)
+                return "retry"
+            logging.info(f"[cart] {pid}: Shortlist control found via {r}")
+            if not await _click_tagged(self.listing, "[data-hw-sl='1']"):
+                res["detail"] = "could not click Shortlist"
+                return "retry"
+            await self.listing.wait_for_timeout(1500)
+        else:
+            logging.info(f"[cart] {pid}: card already shows Shortlisted; re-checking My Shortlist")
+            await self.listing.wait_for_timeout(1500)
+
+        state = await self.listing.evaluate(_CARD_STATE_JS, pid) if mode == "card" else {"popup": "", "badge": None}
+        if state.get("popup") and not before_popup:      # a NEW login prompt appeared after the click
+            res["logged_in"] = False
+            res["detail"] = ("FirstCry asked to log in after clicking Shortlist: the saved session was rejected "
+                             "or expired (logged-in session needed). Re-run login_helper.py and update FIRSTCRY_STATE_B64.")
+            res["evidence"] = await self._shortlist_evidence(item, state)
+            return "final"
+        if await _shortlist_has(self.shortlist, item):
+            return "ready"
+        await self.shortlist.wait_for_timeout(2500)
+        if await _shortlist_has(self.shortlist, item):
+            return "ready"
+        res["detail"] = (f"clicked Shortlist (card shows Shortlisted: {state.get('badge')}) but the car "
+                         f"is not on My Shortlist")
+        if attempt == 1:
+            res["evidence"] = {**res.get("evidence", {}), **(await self._shortlist_evidence(item, state))}
+        return "retry"
+
+    async def _row_state(self, item: dict) -> str:
+        """On the loaded My Shortlist page: 'ok' (Add to cart button tagged), 'undeliverable', 'oos', ..."""
+        r = await self.shortlist.evaluate(_SHORTLIST_ROW_JS, {"key": _title_key(item)})
+        if r == "not-listed":
+            r = await self.shortlist.evaluate(_SHORTLIST_ADD_ANCHOR_JS, {"pid": item["id"], "key": _title_key(item)})
+        return r
+
+    # ---- gate: is the car really buyable at this delivery pincode?
+    async def gate(self, item: dict, deadline: float) -> dict:
+        """Shortlists the car and reads its row. state: 'ok' | 'undeliverable' | 'oos' | 'unknown'."""
+        res = {"status": "failed", "tries": 0, "logged_in": self.logged_in, "detail": ""}
+        try:
+            mode = await self._locate(item, deadline, res)
+            if mode is None:
+                return {"state": "unknown", "pincode": self.pincode, "detail": res["detail"]}
+            for attempt in (1, 2):
+                if time.monotonic() > deadline:
+                    break
+                st = await self._shortlist_step(item, mode, attempt, res)
+                if st == "final":
+                    return {"state": "oos" if res["status"] == "sold_out" else "unknown",
+                            "pincode": self.pincode, "detail": res["detail"], "evidence": res.get("evidence")}
+                if st == "retry":
+                    continue
+                row = await self._row_state(item)
+                logging.info(f"[gate] {item['id']}: My Shortlist row -> {row}")
+                state = {"ok": "ok", "undeliverable": "undeliverable", "oos": "oos"}.get(row, "unknown")
+                return {"state": state, "pincode": self.pincode, "detail": row}
+            return {"state": "unknown", "pincode": self.pincode, "detail": res["detail"]}
+        except Exception as e:
+            logging.warning(f"[gate] {item['id']}: {e}")
+            return {"state": "unknown", "pincode": self.pincode, "detail": str(e)}
+
+    # ---- the add-to-cart loop
     async def add(self, item: dict, deadline: float) -> dict:
         """
-        Listing card -> Shortlist -> My Shortlist -> Add to cart -> verify in cart.
-        (Cars that have no card of their own on the listing use their product page's Shortlist button.)
-        Returns {status: added|sold_out|failed, tries, logged_in, detail, evidence?}
+        Listing card -> Shortlist -> My Shortlist -> Add to cart -> verify in cart (up to CART_ATTEMPTS times).
+        Returns {status: added|sold_out|undeliverable|failed, tries, logged_in, pincode, detail, evidence?}
         """
-        res = {"status": "failed", "tries": 0, "logged_in": self.logged_in, "detail": ""}
+        res = {"status": "failed", "tries": 0, "logged_in": self.logged_in, "pincode": self.pincode, "detail": ""}
         pid = item["id"]
         try:
-            where = await self._find_card(item, deadline)
-            res["logged_in"] = self.logged_in
-            mode = "card"
-            if where == "not-found":
-                mode = "product"
-                self._listing_url = None
-                await self.listing.goto(item["link"], wait_until="domcontentloaded", timeout=30000)
-                await _settle(self.listing, 600)
-                logging.info(f"[cart] {pid}: no listing card, using the product page's Shortlist button")
-            elif where != "found":
-                res["detail"] = f"could not load the listing ({where})"
+            mode = await self._locate(item, deadline, res)
+            if mode is None:
                 return res
-
+            before = None
             for attempt in range(1, CART_ATTEMPTS + 1):
                 if time.monotonic() > deadline:
                     res["detail"] = "time budget reached"
                     break
                 res["tries"] = attempt
+                res["pincode"] = self.pincode
 
-                # 1) Make sure the car is on My Shortlist. Clicking Shortlist on a car that is already
-                #    shortlisted would REMOVE it, so check the page and the card's own state first.
-                if not await _shortlist_has(self.shortlist, item):
-                    state = await self.listing.evaluate(_CARD_STATE_JS, pid) if mode == "card" else {"popup": "", "badge": None}
-                    if state.get("popup"):                       # leftover popup from an earlier click
-                        await self.listing.keyboard.press("Escape")
-                        await self.listing.wait_for_timeout(300)
-                        if mode == "card":
-                            state = await self.listing.evaluate(_CARD_STATE_JS, pid)
-                    before_popup = state.get("popup", "")
-                    if not state.get("badge"):
-                        if mode == "card":
-                            r = await self.listing.evaluate(_CARD_SHORTLIST_JS, pid)
-                            if r == "no-button":
-                                try:      # some sites only inject the control on hover
-                                    await self.listing.locator(f"a[href*='/{pid}/product-detail']:has(img)").first.hover(timeout=3000)
-                                    await self.listing.wait_for_timeout(500)
-                                    r = await self.listing.evaluate(_CARD_SHORTLIST_JS, pid)
-                                except Exception:
-                                    pass
-                        else:
-                            r = await self.listing.evaluate(_PAGE_SHORTLIST_JS)
-                        if r == "oos":
-                            res["status"], res["detail"] = "sold_out", "listing card shows out of stock"
-                            return res
-                        if not str(r).startswith("ok"):
-                            res["detail"] = f"shortlist control: {r} ({mode})"
-                            if attempt == 1:
-                                res["evidence"] = await self._dump_card(item, mode)
-                            continue
-                        logging.info(f"[cart] {pid}: Shortlist control found via {r}")
-                        if not await _click_tagged(self.listing, "[data-hw-sl='1']"):
-                            res["detail"] = "could not click Shortlist"
-                            continue
-                        await self.listing.wait_for_timeout(1500)
-                    else:
-                        logging.info(f"[cart] {pid}: card already shows Shortlisted; re-checking My Shortlist")
-                        await self.listing.wait_for_timeout(1500)
+                st = await self._shortlist_step(item, mode, attempt, res)
+                if st == "final":
+                    return res
+                if st == "retry":
+                    continue
 
-                    state = await self.listing.evaluate(_CARD_STATE_JS, pid) if mode == "card" else {"popup": await self.listing.evaluate(
-                        "() => (document.body.innerText.match(/log\\s*in|sign\\s*in|otp/i) ? 'login text on page' : '')"), "badge": None}
-                    if state.get("popup") and not before_popup:      # a NEW login prompt appeared after the click
-                        res["logged_in"] = False
-                        res["detail"] = ("FirstCry asked to log in after clicking Shortlist: the saved session was rejected "
-                                         "or expired (logged-in session needed). Re-run login_helper.py and update FIRSTCRY_STATE_B64.")
-                        res["evidence"] = await self._shortlist_evidence(item, state)
-                        return res
-                    if not await _shortlist_has(self.shortlist, item):
-                        await self.shortlist.wait_for_timeout(2500)
-                        if not await _shortlist_has(self.shortlist, item):
-                            res["detail"] = (f"clicked Shortlist (card shows Shortlisted: {state.get('badge')}) but the car "
-                                             f"is not on My Shortlist")
-                            if attempt == 1:
-                                ev = await self._shortlist_evidence(item, state)
-                                res["evidence"] = {**res.get("evidence", {}), **ev}
-                            continue
-
-                # 2) Add it to the cart from the shortlist page
-                r = await self.shortlist.evaluate(_SHORTLIST_ADD_JS, pid)
-                if r != "ok":
-                    res["detail"] = f"shortlist page: {r}"
+                row = await self._row_state(item)
+                if row == "undeliverable":
+                    res["status"] = "undeliverable"
+                    res["detail"] = "FirstCry lists this car as 'Undeliverable / Product not deliverable' for the delivery pincode"
+                    return res
+                if row == "oos":
+                    res["status"], res["detail"] = "sold_out", "My Shortlist shows the car as out of stock"
+                    return res
+                if row != "ok":
+                    res["detail"] = f"My Shortlist page: {row}"
                     if attempt == 1:
                         await debug_dump(self.shortlist, f"shortlist_{pid}", force=True)
                     continue
+
+                if before is None:
+                    before = await _cart_count(self.shortlist)
                 if not await _click_tagged(self.shortlist, "[data-hw-target='1']"):
-                    res["detail"] = "could not click Add to cart on the shortlist page"
+                    res["detail"] = "could not click Add to cart on My Shortlist"
                     continue
                 await self.shortlist.wait_for_timeout(1500)
 
-                # 3) Confirm it is really in the cart
-                if await _cart_contains(self.cart, item):
+                if await _cart_contains(self.cart, item, before):
                     res["status"], res["detail"] = "added", ""
                     return res
-                res["detail"] = "added from shortlist but the car is not visible in the cart"
+                res["detail"] = "clicked Add to cart on My Shortlist but the car is not visible in the cart"
 
             await debug_dump(self.cart, f"cart_{pid}", force=True)
             return res
