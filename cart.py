@@ -140,19 +140,36 @@ _CARD_SHORTLIST_JS = r"""
 _PAGE_SHORTLIST_JS = r"""
 () => {
   document.querySelectorAll("[data-hw-sl]").forEach(x => x.removeAttribute("data-hw-sl"));
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  let n, found = null;
-  while ((n = walker.nextNode())) {
-    const t = (n.nodeValue || "").trim();
-    const p = n.parentElement;
-    if (!p || !/^(add to )?(shortlist|wishlist)$/i.test(t)) continue;
-    if (p.closest("a[href*='myshortlist']")) continue;
-    if (!found || (p.offsetParent !== null && found.offsetParent === null)) found = p;
+  const SL = /short\s*-?_?list|wish\s*-?_?list/i, STATE = /shortlisted|my\s*shortlist/i;
+  const own = el => [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.nodeValue.trim()).filter(Boolean).join(" ");
+  const shown = el => { const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none"; };
+  // never click the header's Shortlist link or the bottom bar's Shortlist TAB (that only opens the side panel)
+  const excluded = el => { for (let e = el; e; e = e.parentElement) {
+      if (getComputedStyle(e).position === "fixed") return true;
+      if (e.tagName === "HEADER" || e.tagName === "NAV") return true;
+      if (e.matches && e.matches("a[href*='myshortlist']")) return true; } return false; };
+  const all = [...document.querySelectorAll("body *")].filter(el =>
+      !/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(el.tagName) && !excluded(el));
+  const cls = el => String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : el.className);
+  const icon = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.width < 90 && r.height > 0 && r.height < 90; };
+  const tiers = [
+    ["text",    all.filter(el => /^(add to )?(shortlist|wishlist)$/i.test(own(el)))],
+    ["onclick", all.filter(el => SL.test(el.getAttribute("onclick") || "") && !STATE.test(own(el)))],
+    ["label",   all.filter(el => SL.test((el.getAttribute("title") || "") + " " + (el.getAttribute("aria-label") || "") + " " + (el.getAttribute("alt") || "")) && !STATE.test(own(el)))],
+    ["class",   all.filter(el => SL.test(cls(el) + " " + (el.id || "")) && !STATE.test(cls(el) + own(el)))],
+    ["pseudo",  all.filter(el => ["::before", "::after"].some(p => SL.test(getComputedStyle(el, p).content || "")))],
+    ["heart",   all.filter(el => /heart|favou?rite|\bfav\b/i.test(cls(el) + " " + (el.id || "")) && icon(el) && !STATE.test(cls(el)))],
+  ];
+  for (const [how, list] of tiers) {
+    const vis = list.filter(el => shown(el) && el.getBoundingClientRect().top < 900);
+    const pick = vis[0] || list.find(shown);
+    if (!pick) continue;
+    pick.scrollIntoView({block: "center"});
+    pick.setAttribute("data-hw-sl", "1");
+    return "ok:" + how;
   }
-  if (!found) return "no-button";
-  found.scrollIntoView({block: "center"});
-  found.setAttribute("data-hw-sl", "1");
-  return "ok";
+  return "no-button";
 }
 """
 
@@ -238,6 +255,20 @@ _SHORTLIST_PROBE_JS = r"""
 })
 """
 
+_PAGE_PROBE_JS = r"""
+() => {
+  const own = el => [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.nodeValue.trim()).filter(Boolean).join(" ");
+  const hint = /short|wish|heart|fav|save|like/i;
+  const controls = [...document.querySelectorAll("body *")].filter(el => !/^(SCRIPT|STYLE|NOSCRIPT)$/.test(el.tagName) &&
+      hint.test(String(el.className) + " " + (el.id || "") + " " + (el.getAttribute("onclick") || "") + " " + (el.getAttribute("title") || "") + " " + (el.getAttribute("aria-label") || "")))
+    .slice(0, 40).map(el => { const r = el.getBoundingClientRect();
+      return {tag: el.tagName, cls: String(el.className).slice(0, 120), id: el.id || "", text: own(el).slice(0, 50),
+              onclick: (el.getAttribute("onclick") || "").slice(0, 140), title: el.getAttribute("title") || "",
+              rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)]}; });
+  return {url: location.href, controls};
+}
+"""
+
 _HAS_CARD_JS = r"""
 (pid) => [...document.querySelectorAll("a[href*='/" + pid + "/product-detail']")].some(a => a.querySelector("img"))
 """
@@ -264,19 +295,27 @@ _SHORTLIST_ROW_JS = r"""
 ({key}) => {
   document.querySelectorAll("[data-hw-target]").forEach(x => x.removeAttribute("data-hw-target"));
   const norm = s => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const shown = x => { const r = x.getBoundingClientRect(), cs = getComputedStyle(x);
+                       return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none"; };
   const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  let n, started = false, add = null, flags = "";
+  let n, titleEl = null, add = null, flags = "";
   while ((n = w.nextNode())) {
     const p = n.parentElement;
     if (!p || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(p.tagName)) continue;
     const t = (n.nodeValue || "").trim();
     if (!t) continue;
-    if (!started) { if (key && norm(t).includes(key)) started = true; continue; }
-    if (/^hot wheels/i.test(t) || /^(international|remove all)$/i.test(t) || /^\d+ left$/i.test(t)) break;
-    if (!add && /^add to cart$/i.test(t)) add = p;
+    if (!titleEl) { if (key && norm(t).includes(key) && shown(p)) titleEl = p; continue; }   // the VISIBLE title only
+    // next car, or the end of the list: stop (page footer / hidden shortlist panel must never be read)
+    if (/^hot wheels/i.test(t) || /^(international|remove all|categories)$/i.test(t) || /^\d+ left$/i.test(t) ||
+        /^your shortlist is full/i.test(t) || /^products successfully added/i.test(t)) break;
+    if (!add && /^add to cart$/i.test(t) && shown(p)) {
+      const a = p.getBoundingClientRect(), b = titleEl.getBoundingClientRect();
+      const sameColumn = Math.abs((a.left + a.width / 2) - (b.left + b.width / 2)) < 110;
+      if (sameColumn && a.top >= b.top - 5 && a.top - b.top < 450) add = p;
+    }
     flags += " " + t.toLowerCase();
   }
-  if (!started) return "not-listed";
+  if (!titleEl) return "not-listed";
   if (add) { add.setAttribute("data-hw-target", "1"); return "ok"; }
   if (/undeliverable|not deliverable/.test(flags)) return "undeliverable";
   if (/out of stock|notify me/.test(flags)) return "oos";
@@ -495,25 +534,28 @@ class CartSession:
                     self.logged_in = await _is_logged_in(self.listing)
                 self.pincode = await _read_pincode(self.listing) or self.pincode
             stable, last = 0, -1
-            for _ in range(60):
+            for _ in range(90):
                 if time.monotonic() > deadline:
                     return "timeout"
                 if await self.listing.evaluate(_HAS_CARD_JS, pid):
                     return "found"
                 cnt = await self.listing.evaluate(scraper.FC_COUNT_JS)
-                stable = stable + 1 if cnt == last else 0
-                last = cnt
-                if stable >= 3:
-                    break
+                clicked = False
                 try:
                     more = self.listing.get_by_text(SHOW_MORE).first
                     if await more.count() and await more.is_visible():
                         await more.scroll_into_view_if_needed(timeout=2000)
                         await more.click(timeout=3000)
+                        clicked = True
                     else:
                         await self.listing.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 except Exception:
                     pass
+                # only give up when the list has stopped growing AND there is no 'Show more' button left to press
+                stable = stable + 1 if (cnt == last and not clicked) else 0
+                last = cnt
+                if stable >= 4:
+                    break
                 await self.listing.wait_for_timeout(1000)
             self._listing_url = None            # not on this page; try the next listing URL
         return "not-found"
@@ -543,10 +585,14 @@ class CartSession:
                 evidence["card_html"] = (probe.get("html") or "(none)") if isinstance(probe, dict) else str(probe)
                 probe_txt = json.dumps({k: v for k, v in probe.items() if k != "html"}, indent=1, ensure_ascii=False) \
                     if isinstance(probe, dict) else str(probe)
-                evidence["probe"] = probe_txt
+                evidence["card_html_name"] = f"card_{item['id']}.html"
                 (scraper.DEBUG_DIR / f"card_{item['id']}.html").write_text(evidence["card_html"], encoding="utf-8")
-                (scraper.DEBUG_DIR / f"probe_{item['id']}.json").write_text(probe_txt, encoding="utf-8")
+            else:
+                probe_txt = json.dumps(await self.listing.evaluate(_PAGE_PROBE_JS), indent=1, ensure_ascii=False)
+            evidence["probe"] = probe_txt
+            (scraper.DEBUG_DIR / f"probe_{item['id']}.json").write_text(probe_txt, encoding="utf-8")
             await debug_dump(self.listing, f"listing_{item['id']}", force=True)
+            evidence["listing_png"] = await self.listing.screenshot()
         except Exception as e:
             logging.warning(f"[cart] card dump failed: {e}")
         return evidence
@@ -658,10 +704,29 @@ class CartSession:
             logging.warning(f"[gate] {item['id']}: {e}")
             return {"state": "unknown", "pincode": self.pincode, "detail": str(e)}
 
+    # ---- strict check that the car really went into the cart
+    async def _verify_added(self, item: dict, before) -> bool:
+        """
+        The cart counter in FirstCry's header must go UP. (Only if the counter cannot be read: the car must have left
+        My Shortlist AND show in the cart page.) A car merely being mentioned somewhere on a page is not proof.
+        """
+        for _ in range(3):
+            await self.shortlist.goto(SHORTLIST_URL, wait_until="domcontentloaded", timeout=30000)
+            await _settle(self.shortlist, 800)
+            after = await _cart_count(self.shortlist)
+            if before is not None and after is not None:
+                if after > before:
+                    return True
+                await self.shortlist.wait_for_timeout(1200)      # the counter can lag a moment
+                continue
+            gone = not await self.shortlist.evaluate(_PAGE_HAS_JS, {"pid": item["id"], "key": _title_key(item)})
+            return bool(gone and await _cart_contains(self.cart, item, None))
+        return False
+
     # ---- the add-to-cart loop
     async def add(self, item: dict, deadline: float) -> dict:
         """
-        Listing card -> Shortlist -> My Shortlist -> Add to cart -> verify in cart (up to CART_ATTEMPTS times).
+        Listing card -> Shortlist -> My Shortlist -> Add to cart -> verify (up to CART_ATTEMPTS times).
         Returns {status: added|sold_out|undeliverable|failed, tries, logged_in, pincode, detail, evidence?}
         """
         res = {"status": "failed", "tries": 0, "logged_in": self.logged_in, "pincode": self.pincode, "detail": ""}
@@ -670,7 +735,7 @@ class CartSession:
             mode = await self._locate(item, deadline, res)
             if mode is None:
                 return res
-            before = None
+            before0, repeats, last_detail = None, 0, ""
             for attempt in range(1, CART_ATTEMPTS + 1):
                 if time.monotonic() > deadline:
                     res["detail"] = "time budget reached"
@@ -678,10 +743,24 @@ class CartSession:
                 res["tries"] = attempt
                 res["pincode"] = self.pincode
 
+                if attempt > 1 and before0 is not None:       # an earlier click may have worked after all: never add twice
+                    await self.shortlist.goto(SHORTLIST_URL, wait_until="domcontentloaded", timeout=30000)
+                    await _settle(self.shortlist, 800)
+                    now = await _cart_count(self.shortlist)
+                    if now is not None and now > before0:
+                        res["status"], res["detail"] = "added", ""
+                        return res
+
                 st = await self._shortlist_step(item, mode, attempt, res)
                 if st == "final":
                     return res
                 if st == "retry":
+                    # a missing control is not going to appear by itself: stop after 4 identical failures
+                    repeats = repeats + 1 if res["detail"] == last_detail else 1
+                    last_detail = res["detail"]
+                    if repeats >= 4 and res["detail"].startswith("shortlist control:"):
+                        res["detail"] += " (stopped after 4 identical attempts)"
+                        break
                     continue
 
                 row = await self._row_state(item)
@@ -698,17 +777,18 @@ class CartSession:
                         await debug_dump(self.shortlist, f"shortlist_{pid}", force=True)
                     continue
 
-                if before is None:
-                    before = await _cart_count(self.shortlist)
+                before = await _cart_count(self.shortlist)     # fresh counter, this page is loaded right now
+                if before0 is None:
+                    before0 = before
                 if not await _click_tagged(self.shortlist, "[data-hw-target='1']"):
                     res["detail"] = "could not click Add to cart on My Shortlist"
                     continue
                 await self.shortlist.wait_for_timeout(1500)
 
-                if await _cart_contains(self.cart, item, before):
+                if await self._verify_added(item, before):
                     res["status"], res["detail"] = "added", ""
                     return res
-                res["detail"] = "clicked Add to cart on My Shortlist but the car is not visible in the cart"
+                res["detail"] = "clicked Add to cart on My Shortlist but the cart counter did not go up"
 
             await debug_dump(self.cart, f"cart_{pid}", force=True)
             return res
