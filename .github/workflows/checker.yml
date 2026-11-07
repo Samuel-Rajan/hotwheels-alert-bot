@@ -21,7 +21,7 @@ concurrency:
 jobs:
   check-stock:
     runs-on: ubuntu-latest
-    timeout-minutes: 14
+    timeout-minutes: 20
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -52,6 +52,7 @@ jobs:
           playwright install-deps chromium
 
       - name: Run Bot Script
+        timeout-minutes: 11
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -71,10 +72,26 @@ jobs:
 
       - name: Save Seen Products Database
         if: always()
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "Update inventory state database"
-          file_pattern: inventory.db
+        run: |
+          # inventory.db is the only file the bot changes. If someone pushed to main while the run was going,
+          # a plain push is rejected (non-fast-forward). So: rebuild the commit on top of the latest main and retry.
+          [ -f inventory.db ] || { echo "No inventory.db"; exit 0; }
+          cp inventory.db /tmp/inventory.db
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for i in 1 2 3 4 5; do
+            git fetch origin main
+            git reset --hard origin/main
+            cp /tmp/inventory.db inventory.db
+            git add inventory.db
+            if git diff --cached --quiet; then echo "Nothing to commit"; exit 0; fi
+            git commit -m "Update inventory state database"
+            if git push origin HEAD:main; then exit 0; fi
+            echo "Push rejected (attempt $i), retrying..."
+            sleep $((i * 4))
+          done
+          echo "Could not push inventory.db after 5 attempts"
+          exit 1
 
       - name: Keep scheduled workflow enabled
         if: always()
