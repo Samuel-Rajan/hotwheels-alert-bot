@@ -16,12 +16,12 @@ from db import (init_db, is_first_run, mark_seeded, check_item, mark_missing, ma
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-MAX_VERIFY = 10          # candidates verified/alerted per run (extras are retried next run)
-GATE_MAX = 6             # candidates per run that get the My Shortlist deliverability check before alerting
+MAX_VERIFY = 12          # candidates verified/alerted per run (extras are retried next run)
+GATE_MAX = 12            # candidates per run that get the My Shortlist deliverability check before alerting
 GATE_BUDGET = 60         # seconds allowed per deliverability check
-MAX_CART_ITEMS = 3       # items per run that get the add-to-cart treatment
+MAX_CART_ITEMS = 12      # items per run that get the add-to-cart treatment
 RUN_BUDGET = 330         # seconds after which no new gate/cart job is started
-CART_ITEM_BUDGET = 150   # seconds allowed per item for the wishlist -> cart retries
+CART_ITEM_BUDGET = 100   # seconds allowed per item for the wishlist -> cart retries
 HARD_STOP = 500          # never run browser work past this many seconds into the run
 WATCHDOG = 585           # the process is force-exited after this many seconds, whatever happens
 
@@ -214,7 +214,7 @@ async def monitor_stock():
             if session:
                 for item in fc_items[:MAX_CART_ITEMS]:
                     if time.monotonic() - t0 > RUN_BUDGET:
-                        await send_text(bot, f"⏱️ Skipped cart attempt (run time budget): "
+                        await send_text(bot, f"⏱️ Ran out of run time before reaching this car (add it manually): "
                                              f"{html.escape(item['title'][:70])}")
                         continue
                     deadline = min(time.monotonic() + CART_ITEM_BUDGET, t0 + HARD_STOP)
