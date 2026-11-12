@@ -81,8 +81,17 @@ async def send_cart_result(bot: Bot, item: dict, res: dict):
     link = html.escape(item["link"], quote=True)
     st = res["status"]
     pin = f" (pincode {html.escape(res['pincode'])})" if res.get("pincode") else ""
+    acct = f"\n👤 Bot is logged in as: {html.escape(res['account'])}" if res.get("account") else ""
     if st == "added":
-        head = f"🛒 <b>In your cart ✅</b> via Wishlist (attempt {res['tries']}/{CART_ATTEMPTS})"
+        proof = " Confirmed from a separate login session." if res.get("persisted") else ""
+        head = f"🛒 <b>In your cart ✅</b> via Wishlist (attempt {res['tries']}/{CART_ATTEMPTS}).{proof}{acct}"
+    elif st == "session_only":
+        back = " I put the car back on your Shortlist." if res.get("restored") else ""
+        head = ("⚠️ <b>Added in the bot's browser, but NOT in your own cart.</b> A fresh session with the same saved "
+                f"login sees an empty cart.{back}{acct}")
+    elif st == "shortlist_only":
+        head = ("📌 <b>On your FirstCry Shortlist</b>: open the app → Shortlist → Add to cart. "
+                f"(The bot's cart is not your cart, so I don't add it there.){acct}")
     elif st == "sold_out":
         head = "⚠️ <b>Sold out before I could add it</b>"
     elif st == "undeliverable":
@@ -94,6 +103,10 @@ async def send_cart_result(bot: Bot, item: dict, res: dict):
     if st == "added" and res.get("logged_in") is not True:
         lines.append("ℹ️ This used a guest session, so it is <b>not</b> in your own FirstCry account cart. "
                      "Set the FIRSTCRY_STATE_B64 secret (see login_helper.py) to fill your real cart.")
+    if st == "session_only":
+        lines.append("What to check: (1) in your own browser, is the top right of firstcry.com showing the SAME account "
+                     "as above (not 'Login / Register')? (2) If not, log in there with the same method you used in "
+                     "login_helper.py. (3) If it is the same account, re-run login_helper.py and update FIRSTCRY_STATE_B64.")
     if st == "failed" and res.get("logged_in") is False and "log in" not in (res.get("detail") or ""):
         lines.append("ℹ️ This ran as a guest, so Wishlist and cart can't be tied to your account. "
                      "Set FIRSTCRY_STATE_B64 (see login_helper.py).")
@@ -161,7 +174,7 @@ async def monitor_stock():
 
         confirmed, alerts = [], 0
         verifier = session = None
-        evidence_sent = False
+        evidence_sent = cart_png_sent = False
         try:
             if candidates:
                 verifier = await Verifier.create(browser)
@@ -221,6 +234,13 @@ async def monitor_stock():
                     res = await session.add(item, deadline)
                     logging.info(f"Cart result for {item['id']}: {res}")
                     await send_cart_result(bot, item, res)
+                    if res.get("cart_png") and not cart_png_sent:
+                        try:
+                            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=io.BytesIO(res["cart_png"]),
+                                                 caption="📸 The cart page as the bot sees it")
+                        except Exception as e:
+                            logging.warning(f"Could not send cart screenshot: {e}")
+                        cart_png_sent = True
                     if res["status"] == "failed" and res.get("evidence") and not evidence_sent:
                         await send_evidence(bot, item, res)
                         evidence_sent = True
