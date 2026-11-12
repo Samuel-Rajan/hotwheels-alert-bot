@@ -38,17 +38,15 @@ jobs:
           pip install -r requirements.txt
 
       - name: Cache Playwright browsers
-        id: pw-cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          key: playwright-${{ runner.os }}-1.65.1-${{ hashFiles('requirements.txt') }}
 
       - name: Install Chromium
         run: |
-          if [ "${{ steps.pw-cache.outputs.cache-hit }}" != "true" ]; then
-            playwright install chromium
-          fi
+          # Idempotent: downloads only if this Playwright version's browser is not already cached.
+          playwright install chromium
           playwright install-deps chromium
 
       - name: Run Bot Script
