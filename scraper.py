@@ -3,6 +3,8 @@ import hashlib
 import logging
 import os
 import re
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urljoin
@@ -70,7 +72,15 @@ NO_RESULT_MARKERS = ["no results", "no products found", "couldn't find", "could 
 async def launch_browser():
     """One shared Chromium for scanning, stock verification and cart actions."""
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        try:
+            browser = await p.chromium.launch(headless=True)
+        except Exception as e:
+            if "Executable doesn't exist" not in str(e) and "playwright install" not in str(e):
+                raise
+            # Playwright was updated but the cached browser is an older build: download the right one and retry.
+            logging.warning("Chromium build missing for this Playwright version; running 'playwright install chromium'...")
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, timeout=300)
+            browser = await p.chromium.launch(headless=True)
         try:
             yield p, browser
         finally:
