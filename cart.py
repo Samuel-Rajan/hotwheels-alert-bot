@@ -269,6 +269,22 @@ _PAGE_PROBE_JS = r"""
 }
 """
 
+_WHOAMI_JS = r"""
+() => {
+  const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let n, txt = "";
+  while ((n = w.nextNode())) {
+    const p = n.parentElement;
+    if (!p || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(p.tagName)) continue;
+    txt += " " + n.nodeValue;
+    if (txt.length > 400000) break;
+  }
+  const emails = (txt.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || []).filter(e => !/firstcry|brainbees|example\.com|sentry/i.test(e));
+  const phones = txt.match(/(?<!\d)[6-9]\d{9}(?!\d)/g) || [];
+  return {emails: [...new Set(emails)].slice(0, 2), phones: [...new Set(phones)].slice(0, 2)};
+}
+"""
+
 _HAS_CARD_JS = r"""
 (pid) => [...document.querySelectorAll("a[href*='/" + pid + "/product-detail']")].some(a => a.querySelector("img"))
 """
@@ -377,6 +393,23 @@ async def _is_logged_in(page):
     return None
 
 
+def _mask(s: str) -> str:
+    if "@" in s:
+        user, dom = s.split("@", 1)
+        return user[:2] + "•••@" + dom
+    return s[:2] + "••••••" + s[-3:]
+
+
+async def _whoami(page):
+    """Masked email / phone found in the logged-in page, to compare with the account you use in your browser."""
+    try:
+        r = await page.evaluate(_WHOAMI_JS)
+        found = [_mask(x) for x in (r.get("emails", []) + r.get("phones", []))]
+        return ", ".join(found) if found else None
+    except Exception:
+        return None
+
+
 async def _header_text(page) -> str:
     try:
         return await page.evaluate("() => (document.body.innerText || '').slice(0, 900)")
@@ -395,24 +428,31 @@ async def _cart_count(page):
     return int(m.group(1)) if m else None
 
 
-async def _cart_contains(cart_page, item: dict, before=None) -> bool:
-    """True if the cart counter went up, or the car shows in the cart (by link, image or name)."""
+async def _cart_page_has(page, item: dict) -> str:
+    """
+    Open the cart page and say what it shows: 'yes' (this car is listed), 'empty' ("No items in your cart"),
+    or 'other' (items shown but not this car / could not tell). Polls a few seconds because the cart loads late.
+    """
     try:
-        await cart_page.goto(CART_URL, wait_until="domcontentloaded", timeout=30000)
-        await _settle(cart_page, 1000)
-        count = await _cart_count(cart_page)
-        if before is not None and count is not None and count > before:
-            return True
-        body = _norm(await cart_page.inner_text("body"))
-        if "your cart is empty" in body:
-            return False
-        if await cart_page.locator(f"a[href*='/{item['id']}/'], img[src*='{item['id']}']").count():
-            return True
-        key = _norm(item["title"])[:40]
-        return bool(key) and key in body
+        await page.goto(CART_URL, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
-        logging.warning(f"[cart] check failed: {e}")
-        return False
+        logging.warning(f"[cart] cart page failed to load: {e}")
+        return "other"
+    await _settle(page, 800)
+    key = _norm(item["title"])[:40]
+    end = time.monotonic() + 5
+    state = "other"
+    while True:
+        try:
+            body = _norm(await page.inner_text("body"))
+            if await page.locator(f"a[href*='/{item['id']}/'], img[src*='{item['id']}']").count() or (key and key in body):
+                return "yes"
+            state = "empty" if ("no items in your cart" in body or "your cart is empty" in body) else "other"
+        except Exception:
+            state = "other"
+        if time.monotonic() > end:
+            return state
+        await page.wait_for_timeout(900)
 
 
 async def _shortlist_has(page, item: dict, wait_s: float = 5.0) -> bool:
@@ -497,10 +537,13 @@ class Verifier:
 class CartSession:
     """One browser context (logged in if FIRSTCRY_STATE_B64 is set) shared by all cars in a run."""
 
-    def __init__(self, ctx, listing, shortlist, cart, logged_in_state):
+    def __init__(self, ctx, listing, shortlist, cart, logged_in_state, browser=None, state_path=None):
         self.ctx, self.listing, self.shortlist, self.cart = ctx, listing, shortlist, cart
         self.logged_in = logged_in_state          # False = guest (no state), None = unknown yet
         self.pincode = None                       # delivery pincode shown in FirstCry's header
+        self.account = None                       # masked account hint, e.g. "sa•••@gmail.com"
+        self.browser, self.state_path = browser, state_path
+        self._persist = None                      # cached result of the "does YOUR cart see it?" test
         self._listing_url = None
         self._pin_done = False
 
@@ -512,7 +555,7 @@ class CartSession:
             args["storage_state"] = state
         ctx = await browser.new_context(**args)
         return cls(ctx, await ctx.new_page(), await ctx.new_page(), await ctx.new_page(),
-                   None if state else False)
+                   None if state else False, browser, state)
 
     async def close(self):
         await self.ctx.close()
@@ -532,6 +575,8 @@ class CartSession:
                         await _settle(self.listing, 800)
                 if self.logged_in is None:
                     self.logged_in = await _is_logged_in(self.listing)
+                if self.state_path and not self.account:
+                    self.account = await _whoami(self.listing)
                 self.pincode = await _read_pincode(self.listing) or self.pincode
             stable, last = 0, -1
             for _ in range(90):
@@ -705,23 +750,74 @@ class CartSession:
             return {"state": "unknown", "pincode": self.pincode, "detail": str(e)}
 
     # ---- strict check that the car really went into the cart
-    async def _verify_added(self, item: dict, before) -> bool:
-        """
-        The cart counter in FirstCry's header must go UP. (Only if the counter cannot be read: the car must have left
-        My Shortlist AND show in the cart page.) A car merely being mentioned somewhere on a page is not proof.
-        """
+    async def _verify_added(self, item: dict) -> bool:
+        """The cart page itself must list the car (a counter, or a name somewhere else on a page, is not proof)."""
         for _ in range(3):
-            await self.shortlist.goto(SHORTLIST_URL, wait_until="domcontentloaded", timeout=30000)
-            await _settle(self.shortlist, 800)
-            after = await _cart_count(self.shortlist)
-            if before is not None and after is not None:
-                if after > before:
-                    return True
-                await self.shortlist.wait_for_timeout(1200)      # the counter can lag a moment
-                continue
-            gone = not await self.shortlist.evaluate(_PAGE_HAS_JS, {"pid": item["id"], "key": _title_key(item)})
-            return bool(gone and await _cart_contains(self.cart, item, None))
+            if await _cart_page_has(self.cart, item) == "yes":
+                return True
+            await self.cart.wait_for_timeout(1200)
         return False
+
+    async def _persist_check(self, item: dict):
+        """
+        Open the cart in a BRAND-NEW browser session that only has the saved login (what your own browser has).
+        True = it shows the car, False = that session's cart is empty, None = could not tell / guest.
+        """
+        if not self.state_path or not self.browser:
+            return None
+        if self._persist is not None:
+            return self._persist
+        ctx = None
+        try:
+            args = dict(DESKTOP_CTX)
+            args["storage_state"] = self.state_path
+            ctx = await self.browser.new_context(**args)
+            page = await ctx.new_page()
+            seen = await _cart_page_has(page, item)
+            result = True if seen == "yes" else (False if seen == "empty" else None)
+            logging.info(f"[cart] fresh-session cart check -> {seen}")
+            self._persist = result
+            return result
+        except Exception as e:
+            logging.warning(f"[cart] persistence check failed: {e}")
+            return None
+        finally:
+            if ctx:
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+
+    async def _restore_shortlist(self, item: dict, deadline: float) -> bool:
+        """The bot's 'Add to cart' moved the car OUT of your Shortlist. Put it back so it is not lost."""
+        tmp = {"detail": ""}
+        try:
+            self._listing_url = None                      # reload the listing so the card state is fresh
+            mode = await self._locate(item, deadline, tmp)
+            if mode is None:
+                return False
+            return await self._shortlist_step(item, mode, 2, tmp) == "ready"
+        except Exception as e:
+            logging.warning(f"[cart] restore shortlist failed: {e}")
+            return False
+
+    async def _finish_added(self, item: dict, res: dict, deadline: float) -> dict:
+        """The bot's own session shows the car in its cart. Now check YOUR view of the cart."""
+        res["account"] = self.account
+        res["persisted"] = await self._persist_check(item)
+        if res["persisted"] is False:
+            res["status"] = "session_only"
+            res["detail"] = "a fresh session using the same saved login sees an empty cart"
+            res["restored"] = await self._restore_shortlist(item, max(deadline, time.monotonic() + 40))
+        else:
+            res["status"], res["detail"] = "added", ""
+        try:
+            await self.cart.goto(CART_URL, wait_until="domcontentloaded", timeout=30000)
+            await _settle(self.cart, 1000)
+            res["cart_png"] = await self.cart.screenshot()
+        except Exception:
+            pass
+        return res
 
     # ---- the add-to-cart loop
     async def add(self, item: dict, deadline: float) -> dict:
@@ -735,7 +831,16 @@ class CartSession:
             mode = await self._locate(item, deadline, res)
             if mode is None:
                 return res
-            before0, repeats, last_detail = None, 0, ""
+            if self._persist is False:
+                # Known from an earlier car in this run: the bot's cart is NOT your cart. Moving cars into it would
+                # only remove them from your Shortlist, so just make sure they are on your Shortlist.
+                st = await self._shortlist_step(item, mode, 1, res)
+                if st == "final":
+                    return res
+                res["account"] = self.account
+                res["status"] = "shortlist_only" if st == "ready" else "failed"
+                return res
+            clicked_once, repeats, last_detail = False, 0, ""
             for attempt in range(1, CART_ATTEMPTS + 1):
                 if time.monotonic() > deadline:
                     res["detail"] = "time budget reached"
@@ -743,13 +848,9 @@ class CartSession:
                 res["tries"] = attempt
                 res["pincode"] = self.pincode
 
-                if attempt > 1 and before0 is not None:       # an earlier click may have worked after all: never add twice
-                    await self.shortlist.goto(SHORTLIST_URL, wait_until="domcontentloaded", timeout=30000)
-                    await _settle(self.shortlist, 800)
-                    now = await _cart_count(self.shortlist)
-                    if now is not None and now > before0:
-                        res["status"], res["detail"] = "added", ""
-                        return res
+                if attempt > 1 and clicked_once:             # an earlier click may have worked late: never add twice
+                    if await _cart_page_has(self.cart, item) == "yes":
+                        return await self._finish_added(item, res, deadline)
 
                 st = await self._shortlist_step(item, mode, attempt, res)
                 if st == "final":
@@ -777,18 +878,15 @@ class CartSession:
                         await debug_dump(self.shortlist, f"shortlist_{pid}", force=True)
                     continue
 
-                before = await _cart_count(self.shortlist)     # fresh counter, this page is loaded right now
-                if before0 is None:
-                    before0 = before
                 if not await _click_tagged(self.shortlist, "[data-hw-target='1']"):
                     res["detail"] = "could not click Add to cart on My Shortlist"
                     continue
+                clicked_once = True
                 await self.shortlist.wait_for_timeout(1500)
 
-                if await self._verify_added(item, before):
-                    res["status"], res["detail"] = "added", ""
-                    return res
-                res["detail"] = "clicked Add to cart on My Shortlist but the cart counter did not go up"
+                if await self._verify_added(item):
+                    return await self._finish_added(item, res, deadline)
+                res["detail"] = "clicked Add to cart on My Shortlist but the cart page does not list the car"
 
             await debug_dump(self.cart, f"cart_{pid}", force=True)
             return res
